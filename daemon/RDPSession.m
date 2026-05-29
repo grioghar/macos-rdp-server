@@ -7,12 +7,13 @@
 #import "input/ClipboardSync.h"
 #import "audio/AudioCapture.h"
 #import "audio/AudioRedirect.h"
-#import <syslog.h>
 #import <unistd.h>
+#define RDP_LOG_COMPONENT "session"
+#include "logging/RDPLog.h"
 
 static const uint32_t kDefaultWidth   = 1920;
 static const uint32_t kDefaultHeight  = 1080;
-static const uint32_t kDefaultBitrate = 8000; /* kbps */
+static const uint32_t kDefaultBitrate = 8000;
 
 @interface RDPSession ()
 @property (nonatomic, assign) int fd;
@@ -26,7 +27,6 @@ static const uint32_t kDefaultBitrate = 8000; /* kbps */
 @property (nonatomic, strong) ClipboardSync   *clipboard;
 @property (nonatomic, strong) AudioCapture    *audio;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue;
-@property (nonatomic, strong) dispatch_source_t readSource;
 @end
 
 @implementation RDPSession
@@ -42,16 +42,17 @@ static const uint32_t kDefaultBitrate = 8000; /* kbps */
     return self;
 }
 
-- (int)clientFd           { return _fd; }
-- (RDPSessionState)state  { return _sessionState; }
+- (int)clientFd             { return _fd; }
+- (RDPSessionState)state    { return _sessionState; }
 - (NSString *)clientAddress { return _address; }
 
 - (void)start {
+    rdp_info("starting session for %s", _address.UTF8String);
     dispatch_async(_sessionQueue, ^{ [self setupAndRun]; });
 }
 
 - (void)setupAndRun {
-    /* Build peer callbacks bridging into self. */
+    rdp_verbose("creating RDP peer for fd=%d", _fd);
     RDPPeerCallbacks cb = {
         .onKeyboard  = rdp_on_keyboard,
         .onMouse     = rdp_on_mouse,
@@ -63,17 +64,19 @@ static const uint32_t kDefaultBitrate = 8000; /* kbps */
 
     _peer = rdp_peer_create(_fd, &cb);
     if (!_peer) {
+        rdp_error("rdp_peer_create failed for %s", _address.UTF8String);
         [self endWithError:[NSError errorWithDomain:@"RDPError" code:1
-                                          userInfo:@{NSLocalizedDescriptionKey: @"peer_create failed"}]];
+                            userInfo:@{NSLocalizedDescriptionKey: @"peer_create failed"}]];
         return;
     }
 
     _sessionState = RDPSessionStateNegotiating;
+    rdp_verbose("RDP negotiation started with %s", _address.UTF8String);
 
-    /* Poll loop — runs until session ends. */
     while (_sessionState != RDPSessionStateDisconnecting &&
            _sessionState != RDPSessionStateDisconnected) {
         if (!rdp_peer_run_once(_peer)) {
+            rdp_verbose("peer loop ended for %s", _address.UTF8String);
             break;
         }
     }
@@ -81,9 +84,9 @@ static const uint32_t kDefaultBitrate = 8000; /* kbps */
     [self teardown];
 }
 
-/* Called from RDP peer when client is fully activated and has sent desktop size. */
 static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_info("client activated: %ux%u @%ubpp", w, h, depth);
     dispatch_async(self.sessionQueue, ^{
         [self setupDisplayAndMediaForWidth:w height:h];
     });
@@ -91,28 +94,29 @@ static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
 
 static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_debug("key flags=0x%04x code=0x%02x", flags, code);
     [self.injector injectKeyEvent:flags scanCode:code];
 }
 
 static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
-    if (flags & RDP_MOUSE_WHEEL) {
-        [self.injector injectMouseWheelEvent:flags
-                                       delta:(int16_t)(flags >> 8)
-                                           x:x y:y];
-    } else {
+    rdp_debug("mouse flags=0x%04x x=%u y=%u", flags, x, y);
+    if (flags & RDP_MOUSE_WHEEL)
+        [self.injector injectMouseWheelEvent:flags delta:(int16_t)(flags >> 8) x:x y:y];
+    else
         [self.injector injectMouseEvent:flags x:x y:y];
-    }
 }
 
 static void rdp_on_mouse_ex(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_debug("mouse_ex flags=0x%04x x=%u y=%u", flags, x, y);
     [self.injector injectMouseEvent:flags x:x y:y];
 }
 
 static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
                               uint32_t format) {
     RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_verbose("clipboard from client: format=0x%08x len=%zu", format, len);
     [self.clipboard receiveFromClient:data length:len format:format];
 }
 
@@ -120,84 +124,85 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     uint32_t width  = w  ?: kDefaultWidth;
     uint32_t height = h ?: kDefaultHeight;
 
-    /* Virtual display */
+    rdp_info("setting up display %ux%u for %s", width, height, _address.UTF8String);
+
     _display = [[VirtualDisplay alloc] initWithWidth:width height:height hiDPI:NO];
     if (![_display create]) {
-        syslog(LOG_WARNING, "VirtualDisplay creation failed, falling back to main display");
+        rdp_verbose("VirtualDisplay unavailable, falling back to main display");
         _display = nil;
+    } else {
+        rdp_verbose("VirtualDisplay created: displayID=%u", _display.displayID);
     }
 
-    CGDirectDisplayID displayID = _display
-        ? _display.displayID
-        : CGMainDisplayID();
+    CGDirectDisplayID displayID = _display ? _display.displayID : CGMainDisplayID();
 
-    /* Screen capture → encoder → peer */
     _encoder = [[FrameEncoder alloc] initWithWidth:width height:height
                                            bitrate:kDefaultBitrate];
     __weak typeof(self) weak = self;
     _encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame) {
-        (void)keyFrame;
+        rdp_debug("encoded frame: len=%zu keyFrame=%d", len, keyFrame);
         rdp_peer_send_h264_frame(weak.peer, data, len, width, height);
     };
     [_encoder start];
+    rdp_verbose("H.264 encoder started at %u kbps", kDefaultBitrate);
 
     _capture = [[ScreenCapture alloc] initWithDisplayID:displayID];
     _capture.frameHandler = ^(IOSurfaceRef surface, uint32_t fw, uint32_t fh,
                                CGRect dirty) {
-        (void)fw; (void)fh; (void)dirty;
+        (void)fw; (void)fh;
+        rdp_debug("captured frame: dirty=(%.0f,%.0f,%.0fx%.0f)",
+                  dirty.origin.x, dirty.origin.y,
+                  dirty.size.width, dirty.size.height);
         [weak.encoder encodeFrame:surface];
     };
     [_capture startWithWidth:width height:height];
+    rdp_verbose("screen capture started on displayID=%u", displayID);
 
-    /* Input injection */
-    _injector = [[InputInjector alloc] initWithDisplayID:displayID];
-
-    /* Clipboard */
+    _injector  = [[InputInjector alloc] initWithDisplayID:displayID];
     _clipboard = [[ClipboardSync alloc] init];
-    _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len,
-                                      uint32_t fmt) {
+    _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len, uint32_t fmt) {
+        rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", fmt, len);
         rdp_peer_send_clipboard(weak.peer, data, len, fmt);
     };
     [_clipboard start];
 
-    /* Audio */
     _audio = [[AudioCapture alloc] init];
     _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
+        rdp_debug("audio: %u frames", frameCount);
         RDPPeerContext *ctx = (RDPPeerContext *)weak.peer->context;
-        if (ctx && ctx->rdpsnd) {
+        if (ctx && ctx->rdpsnd)
             audio_redirect_send(ctx->rdpsnd, samples, frameCount, 48000, 2);
-        }
     };
     NSError *audioErr = nil;
     if (![_audio startWithError:&audioErr]) {
-        syslog(LOG_WARNING, "Audio capture failed: %s",
-               audioErr.localizedDescription.UTF8String);
+        rdp_verbose("audio capture unavailable: %s",
+                    audioErr.localizedDescription.UTF8String);
+    } else {
+        rdp_verbose("audio capture started");
     }
 
     _sessionState = RDPSessionStateActive;
+    rdp_info("session active for %s", _address.UTF8String);
 }
 
 - (void)disconnect {
+    rdp_info("disconnecting %s", _address.UTF8String);
     _sessionState = RDPSessionStateDisconnecting;
 }
 
 - (void)teardown {
+    rdp_verbose("tearing down session for %s", _address.UTF8String);
     [_capture stop];
     [_encoder stop];
     [_audio stop];
     [_clipboard stop];
     [_display destroy];
 
-    if (_peer) {
-        rdp_peer_destroy(_peer);
-        _peer = NULL;
-    }
-    if (_fd >= 0) {
-        close(_fd);
-        _fd = -1;
-    }
+    if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }
+    if (_fd >= 0) { close(_fd); _fd = -1; }
 
     _sessionState = RDPSessionStateDisconnected;
+    rdp_info("session torn down for %s", _address.UTF8String);
     [self endWithError:nil];
 }
 

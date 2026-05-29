@@ -57,6 +57,7 @@ endif()
 
 # ── Target ────────────────────────────────────────────────────────────────
 add_executable(macos-rdp-daemon
+    logging/RDPLog.c
     daemon/main.m
     daemon/RDPServer.m
     daemon/RDPSession.m

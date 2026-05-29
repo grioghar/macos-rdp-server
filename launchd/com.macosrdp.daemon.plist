@@ -39,6 +39,13 @@
         </dict>
     </dict>
 
+    <!-- Set RDP_LOG_LEVEL=verbose or debug here for troubleshooting. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>RDP_LOG_LEVEL</key>
+        <string>info</string>
+    </dict>
+
     <key>StandardOutPath</key>
     <string>/var/log/macos-rdp-daemon.log</string>
 

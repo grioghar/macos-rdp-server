@@ -1,12 +1,14 @@
 #import "display/ScreenCapture.h"
 #import <CoreGraphics/CGDisplayStream.h>
-#import <syslog.h>
+#define RDP_LOG_COMPONENT "capture"
+#include "logging/RDPLog.h"
 
 @interface ScreenCapture ()
 @property (nonatomic, assign) CGDirectDisplayID displayID;
 @property (nonatomic, assign) CGDisplayStreamRef stream;
 @property (nonatomic, assign) BOOL capturing;
 @property (nonatomic, strong) dispatch_queue_t captureQueue;
+@property (nonatomic, assign) uint64_t frameCount;
 @end
 
 @implementation ScreenCapture
@@ -24,12 +26,9 @@
 
 - (BOOL)startWithWidth:(uint32_t)width height:(uint32_t)height {
     if (_capturing) return YES;
+    rdp_verbose("starting CGDisplayStream on displayID=%u %ux%u", _displayID, width, height);
 
     NSDictionary *opts = @{
-        /* BGRA is the native format for CGDisplayStream — zero-copy path. */
-        (__bridge NSString *)kCGDisplayStreamSourceRect:
-            (__bridge id)CFBridgingRelease(
-                CGRectCreateDictionaryRepresentation(CGRectMake(0,0,width,height))),
         (__bridge NSString *)kCGDisplayStreamPreserveAspectRatio: @NO,
         (__bridge NSString *)kCGDisplayStreamMinimumFrameTime:    @(1.0/60.0),
         (__bridge NSString *)kCGDisplayStreamShowCursor:          @YES,
@@ -37,30 +36,33 @@
 
     __weak typeof(self) weak = self;
     _stream = CGDisplayStreamCreateWithDispatchQueue(
-        _displayID,
-        (size_t)width, (size_t)height,
-        'BGRA',   /* kCVPixelFormatType_32BGRA */
-        (__bridge CFDictionaryRef)opts,
-        _captureQueue,
-        ^(CGDisplayStreamFrameStatus status,
-          uint64_t displayTime,
-          IOSurfaceRef frameSurface,
-          CGDisplayStreamUpdateRef updateRef) {
+        _displayID, (size_t)width, (size_t)height,
+        'BGRA', (__bridge CFDictionaryRef)opts, _captureQueue,
+        ^(CGDisplayStreamFrameStatus status, uint64_t displayTime,
+          IOSurfaceRef frameSurface, CGDisplayStreamUpdateRef updateRef) {
             (void)displayTime;
-            if (status != kCGDisplayStreamFrameStatusFrameComplete) return;
-            if (!frameSurface) return;
+            if (status == kCGDisplayStreamFrameStatusStopped) {
+                rdp_verbose("display stream stopped");
+                return;
+            }
+            if (status != kCGDisplayStreamFrameStatusFrameComplete || !frameSurface) return;
 
-            /* Compute the dirty rect union for this update. */
+            weak.frameCount++;
+            if (weak.frameCount % 300 == 0)
+                rdp_verbose("capture: %llu frames delivered", (unsigned long long)weak.frameCount);
+
             size_t rectCount = 0;
             const CGRect *rects = CGDisplayStreamUpdateGetRects(
                 updateRef, kCGDisplayStreamUpdateDirtyRects, &rectCount);
             CGRect dirty = CGRectZero;
-            for (size_t i = 0; i < rectCount; i++) {
+            for (size_t i = 0; i < rectCount; i++)
                 dirty = CGRectUnion(dirty, rects[i]);
-            }
-            if (CGRectIsEmpty(dirty)) {
+            if (CGRectIsEmpty(dirty))
                 dirty = CGRectMake(0, 0, width, height);
-            }
+
+            rdp_debug("frame dirty=(%.0f,%.0f,%.0fx%.0f) rects=%zu",
+                      dirty.origin.x, dirty.origin.y,
+                      dirty.size.width, dirty.size.height, rectCount);
 
             ScreenCaptureFrameBlock handler = weak.frameHandler;
             if (handler) handler(frameSurface, width, height, dirty);
@@ -68,34 +70,29 @@
     );
 
     if (!_stream) {
-        syslog(LOG_ERR, "CGDisplayStreamCreate failed for display %u", _displayID);
+        rdp_error("CGDisplayStreamCreate failed for displayID=%u", _displayID);
         return NO;
     }
 
     CGError err = CGDisplayStreamStart(_stream);
     if (err != kCGErrorSuccess) {
-        syslog(LOG_ERR, "CGDisplayStreamStart failed: %d", err);
-        CFRelease(_stream);
-        _stream = NULL;
+        rdp_error("CGDisplayStreamStart failed: %d (check Screen Recording permission)", err);
+        CFRelease(_stream); _stream = NULL;
         return NO;
     }
 
     _capturing = YES;
+    rdp_info("capture started on displayID=%u", _displayID);
     return YES;
 }
 
 - (void)stop {
     if (!_capturing) return;
+    rdp_verbose("stopping capture after %llu frames", (unsigned long long)_frameCount);
     _capturing = NO;
-    if (_stream) {
-        CGDisplayStreamStop(_stream);
-        CFRelease(_stream);
-        _stream = NULL;
-    }
+    if (_stream) { CGDisplayStreamStop(_stream); CFRelease(_stream); _stream = NULL; }
 }
 
-- (void)dealloc {
-    [self stop];
-}
+- (void)dealloc { [self stop]; }
 
 @end

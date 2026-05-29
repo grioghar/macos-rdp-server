@@ -5,7 +5,8 @@
 #import <arpa/inet.h>
 #import <fcntl.h>
 #import <unistd.h>
-#import <syslog.h>
+#define RDP_LOG_COMPONENT "server"
+#include "logging/RDPLog.h"
 
 @interface RDPServer () <RDPSessionDelegate>
 @property (nonatomic, assign) int listenFd;
@@ -33,19 +34,19 @@
 - (BOOL)isRunning   { return _running; }
 
 - (BOOL)startWithError:(NSError **)error {
+    rdp_verbose("creating IPv6 dual-stack listen socket on port %u", _portValue);
+
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) {
+        rdp_error("socket() failed: %s", strerror(errno));
         if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
                                                 code:errno userInfo:nil];
         return NO;
     }
 
-    int yes = 1;
+    int yes = 1, no = 0;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-    /* Dual-stack: accept IPv4-mapped addresses on the IPv6 socket. */
-    int no = 0;
     setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &no, sizeof(no));
-
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
 
     struct sockaddr_in6 addr = {0};
@@ -53,8 +54,15 @@
     addr.sin6_port   = htons(_portValue);
     addr.sin6_addr   = in6addr_any;
 
-    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-        listen(fd, 8) < 0) {
+    if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        rdp_error("bind() failed on port %u: %s", _portValue, strerror(errno));
+        if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
+                                                code:errno userInfo:nil];
+        close(fd);
+        return NO;
+    }
+    if (listen(fd, 8) < 0) {
+        rdp_error("listen() failed: %s", strerror(errno));
         if (error) *error = [NSError errorWithDomain:NSPOSIXErrorDomain
                                                 code:errno userInfo:nil];
         close(fd);
@@ -63,6 +71,7 @@
 
     _listenFd = fd;
     _running  = YES;
+    rdp_debug("listen socket fd=%d ready", fd);
 
     _acceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
                                            (uintptr_t)fd, 0, _acceptQueue);
@@ -78,25 +87,31 @@
     struct sockaddr_in6 clientAddr = {0};
     socklen_t len = sizeof(clientAddr);
     int clientFd = accept(_listenFd, (struct sockaddr *)&clientAddr, &len);
-    if (clientFd < 0) return;
+    if (clientFd < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            rdp_error("accept() failed: %s", strerror(errno));
+        return;
+    }
 
     char addrBuf[INET6_ADDRSTRLEN] = {0};
     inet_ntop(AF_INET6, &clientAddr.sin6_addr, addrBuf, sizeof(addrBuf));
     NSString *addr = [NSString stringWithUTF8String:addrBuf];
 
+    rdp_verbose("accepted connection from %s (fd=%d)", addrBuf, clientFd);
+
     RDPSession *session = [[RDPSession alloc] initWithFileDescriptor:clientFd
                                                        clientAddress:addr];
     session.delegate = self;
 
-    @synchronized(self) {
-        [_sessions addObject:session];
-    }
+    @synchronized(self) { [_sessions addObject:session]; }
+    rdp_debug("active sessions: %lu", (unsigned long)_sessions.count);
 
     [self.delegate serverDidAcceptSession:session];
     [session start];
 }
 
 - (void)stop {
+    rdp_info("stopping server");
     _running = NO;
     if (_acceptSource) {
         dispatch_source_cancel(_acceptSource);
@@ -107,16 +122,15 @@
         _listenFd = -1;
     }
     @synchronized(self) {
+        rdp_verbose("disconnecting %lu active sessions", (unsigned long)_sessions.count);
         for (RDPSession *s in _sessions) [s disconnect];
         [_sessions removeAllObjects];
     }
 }
 
-/* RDPSessionDelegate */
 - (void)sessionDidEnd:(RDPSession *)session error:(NSError *)error {
-    @synchronized(self) {
-        [_sessions removeObject:session];
-    }
+    @synchronized(self) { [_sessions removeObject:session]; }
+    rdp_debug("session removed; %lu remaining", (unsigned long)_sessions.count);
     [self.delegate serverSession:session didEndWithError:error];
 }
 

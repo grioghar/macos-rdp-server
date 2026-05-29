@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Required for CGVirtualDisplay to create displays for other sessions -->
+    <key>com.apple.developer.virtual-display</key>
+    <true/>
+
+    <!-- Required to capture screen content via CGDisplayStream -->
+    <key>com.apple.security.screen-recording</key>
+    <true/>
+
+    <!-- Required for CGEventPost to inject events into other apps -->
+    <key>com.apple.security.automation.apple-events</key>
+    <true/>
+
+    <!-- Required to record system audio from the output device -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- System Extension management (to activate the HID DriverKit extension) -->
+    <key>com.apple.developer.system-extension.install</key>
+    <true/>
+
+    <!-- Activates the RDP HID DriverKit driver -->
+    <key>com.apple.developer.driverkit.userclient-access</key>
+    <array>
+        <string>com.macosrdp.hid-driver</string>
+    </array>
+
+    <!-- Hardened Runtime base entitlements -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <false/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <false/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <false/>
+</dict>
+</plist>

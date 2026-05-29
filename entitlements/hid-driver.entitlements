@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Core DriverKit entitlement — required for all DEXT bundles -->
+    <key>com.apple.developer.driverkit</key>
+    <true/>
+
+    <!-- HID family membership -->
+    <key>com.apple.developer.driverkit.family.hid.device</key>
+    <true/>
+
+    <key>com.apple.developer.driverkit.family.hid.eventservice</key>
+    <true/>
+
+    <!-- Allows the daemon to open a user client connection to this driver -->
+    <key>com.apple.developer.driverkit.allow-any-userclient-access</key>
+    <true/>
+</dict>
+</plist>

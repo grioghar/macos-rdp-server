@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.macosrdp.hid-driver</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>RDP HID Driver</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleExecutable</key>
+    <string>RDPHIDDriver</string>
+    <key>CFBundlePackageType</key>
+    <string>DEXT</string>
+
+    <key>OSBundleUsageDescription</key>
+    <string>The RDP HID driver provides virtual keyboard and mouse input for remote desktop sessions.</string>
+
+    <!-- DriverKit match: no physical hardware needed — activated programmatically -->
+    <key>IOKitPersonalities</key>
+    <dict>
+        <key>RDPHIDDriver</key>
+        <dict>
+            <key>CFBundleIdentifier</key>
+            <string>com.macosrdp.hid-driver</string>
+            <key>IOClass</key>
+            <string>AppleUserHIDDevice</string>
+            <key>IOProviderClass</key>
+            <string>IOUserHIDDevice</string>
+            <key>IOUserClass</key>
+            <string>RDPHIDDriver</string>
+            <key>HIDDefaultBehavior</key>
+            <string>Keyboard</string>
+            <key>IOPropertyMatch</key>
+            <dict>
+                <key>RDPVirtualDevice</key>
+                <true/>
+            </dict>
+        </dict>
+    </dict>
+
+    <key>OSMinimumDriverKitVersion</key>
+    <string>21.0</string>
+</dict>
+</plist>

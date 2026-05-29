@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v1
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v2
 
       - name: Build FreeRDP from source (static)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -71,6 +71,10 @@ jobs:
               -DWITH_SHADOW=OFF \
               -DWITH_SAMPLE=OFF \
               -DWITH_FFMPEG=OFF \
+              -DWITH_SWSCALE=OFF \
+              -DWITH_DSP_FFMPEG=OFF \
+              -DWITH_CAIRO=OFF \
+              -DWITH_OPUS=OFF \
               -DWITH_WAYLAND=OFF \
               -DWITH_X11=OFF \
               -DWITH_CUPS=OFF \
@@ -92,6 +96,7 @@ jobs:
               -DWITH_PARALLEL=OFF \
               -DWITH_URBDRC=OFF \
               -DWITH_VIDEO_ENCODER=OFF \
+              -DWITH_RDTK=OFF \
               -DWITH_SSE2=ON \
               -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" \
               -DOPENSSL_USE_STATIC_LIBS=TRUE

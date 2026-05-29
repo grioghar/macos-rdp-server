@@ -97,8 +97,12 @@ target_link_libraries(macos-rdp-daemon PRIVATE
 
 target_compile_options(macos-rdp-daemon PRIVATE
     -fobjc-arc
+    -Os
     -Wall -Wextra -Wno-unused-parameter
 )
+
+# Link-time optimisation — dead-strips unused code across translation units.
+set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.2"

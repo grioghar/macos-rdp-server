@@ -44,7 +44,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v2
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v3
 
       - name: Build FreeRDP from source (static)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -60,7 +60,9 @@ jobs:
               https://github.com/FreeRDP/FreeRDP.git "$SRC"
 
           cmake -S "$SRC" -B "$SRC/build" -G Ninja \
-              -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_BUILD_TYPE=MinSizeRel \
+              -DCMAKE_C_FLAGS="-Os" \
+              -DCMAKE_CXX_FLAGS="-Os" \
               -DCMAKE_INSTALL_PREFIX="$INSTALL" \
               -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
               -DCMAKE_PREFIX_PATH="$OPENSSL_ROOT" \
@@ -68,8 +70,10 @@ jobs:
               -DWITH_SERVER=ON \
               -DWITH_CLIENT=OFF \
               -DWITH_CLIENT_COMMON=OFF \
+              -DWITH_PROXY=OFF \
               -DWITH_SHADOW=OFF \
               -DWITH_SAMPLE=OFF \
+              -DWITH_WINPR_TOOLS=OFF \
               -DWITH_FFMPEG=OFF \
               -DWITH_SWSCALE=OFF \
               -DWITH_DSP_FFMPEG=OFF \
@@ -98,6 +102,8 @@ jobs:
               -DWITH_VIDEO_ENCODER=OFF \
               -DWITH_RDTK=OFF \
               -DWITH_SSE2=ON \
+              -DWITH_NEON=OFF \
+              -DBUILD_TESTING=OFF \
               -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" \
               -DOPENSSL_USE_STATIC_LIBS=TRUE
 

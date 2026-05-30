@@ -60,7 +60,7 @@ static bool peer_load_certificate(freerdp_peer *peer) {
     return true;
 }
 
-static void peer_apply_settings(freerdp_peer *peer) {
+static bool peer_apply_settings(freerdp_peer *peer) {
     rdpSettings *s = peer->context->settings;
     /* Only set what we actually use. Every extra setting is dead weight. */
     freerdp_settings_set_bool(s,   FreeRDP_NetworkAutoDetect,       FALSE);
@@ -85,8 +85,16 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
 
-    peer_load_certificate(peer);
+    /* Refuse the connection if the TLS material is missing rather than
+     * proceeding and relying on the handshake to fail later. Proceeding is
+     * unsafe: with the legacy RDP security layer also offered, a client could
+     * negotiate a path that does not require the server certificate at all. */
+    if (!peer_load_certificate(peer)) {
+        rdp_error("refusing connection: TLS certificate/key unavailable — run gen-tls-cert.sh");
+        return false;
+    }
     rdp_debug("peer settings applied");
+    return true;
 }
 
 /* ── Context lifecycle ─────────────────────────────────────────────────── */
@@ -375,7 +383,12 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (callbacks) ctx->callbacks = *callbacks;
 
-    peer_apply_settings(peer);
+    if (!peer_apply_settings(peer)) {
+        rdp_error("peer_apply_settings failed");
+        freerdp_peer_context_free(peer);
+        freerdp_peer_free(peer);
+        return NULL;
+    }
     peer->PostConnect = peer_post_connect;
     peer->Activate    = peer_activate;
 

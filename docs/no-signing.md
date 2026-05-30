@@ -20,7 +20,7 @@ The DriverKit HID extension is a quality enhancement. Without it, input injectio
 
 ```bash
 # Install
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 
 # Grant Privacy permissions (easiest: System Settings → Privacy & Security)
 # Or if SIP is disabled:

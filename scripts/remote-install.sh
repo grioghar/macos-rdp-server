@@ -1,13 +1,13 @@
 #!/bin/bash
 # macos-rdp-server one-line installer.
-# Usage: curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 
 set -euo pipefail
 
 REPO="grioghar/macos-rdp-server"
 BINARY_DEST="/usr/local/sbin/macos-rdp-daemon"
 PLIST_DEST="/Library/LaunchDaemons/com.macosrdp.daemon.plist"
-RAW="https://raw.githubusercontent.com/$REPO/main"
+RAW="https://raw.githubusercontent.com/$REPO/master"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
 log()  { echo -e "${GREEN}==>${NC} $*"; }

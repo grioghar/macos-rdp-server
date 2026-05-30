@@ -23,7 +23,7 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 ## One-line install
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 ```
 
 Downloads the latest pre-built **universal binary** (a single file that runs natively on both Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no runtime dependencies — the binary links only against macOS system frameworks.

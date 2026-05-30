@@ -4,7 +4,7 @@ Lightweight RDP server for macOS. Single universal binary — runs natively on I
 
 ### One-line install
 
-    curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
+    curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 
 ### Manual binary download
 

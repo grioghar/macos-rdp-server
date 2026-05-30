@@ -37,6 +37,12 @@ struct rdp_peer_context {
     bool                 gfxReady;
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
+    /* Clipboard: the host's current data, advertised via Format List and held
+     * until the client sends a Format Data Request (MS-RDPECLIP flow). Owned
+     * copy — the source pasteboard pointer is only valid during the send call. */
+    uint8_t             *clipData;
+    size_t               clipLen;
+    uint32_t             clipFormat;
 };
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks);

@@ -59,6 +59,7 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
+    if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
     rdp_debug("peer context freed");
 }
 
@@ -163,6 +164,28 @@ static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
     return CHANNEL_RC_OK;
 }
 
+/* Client pasted: it requests the bytes for a format we advertised. Reply with
+ * the held host data (or an empty failure response if we have none). */
+static UINT cliprdr_client_format_data_request(
+        CliprdrServerContext *cliprdr,
+        const CLIPRDR_FORMAT_DATA_REQUEST *req) {
+    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
+    CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
+
+    if (ctx->clipData && ctx->clipLen > 0) {
+        resp.common.msgFlags     = CB_RESPONSE_OK;
+        resp.common.dataLen      = (UINT32)ctx->clipLen;
+        resp.requestedFormatData = (BYTE *)ctx->clipData;
+        rdp_verbose("clipboard: serving %zu bytes for format 0x%08x",
+                    ctx->clipLen, req->requestedFormatId);
+    } else {
+        resp.common.msgFlags = CB_RESPONSE_FAIL;
+        rdp_verbose("clipboard: data request but nothing held");
+    }
+    cliprdr->ServerFormatDataResponse(cliprdr, &resp);
+    return CHANNEL_RC_OK;
+}
+
 /* ── Audio activated callback ──────────────────────────────────────────── */
 
 static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
@@ -207,6 +230,7 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         ctx->cliprdr->rdpcontext               = peer->context;
         ctx->cliprdr->ClientFormatList         = cliprdr_client_format_list;
         ctx->cliprdr->ClientFormatDataResponse = cliprdr_client_format_data;
+        ctx->cliprdr->ClientFormatDataRequest  = cliprdr_client_format_data_request;
         ctx->cliprdr->useLongFormatNames       = TRUE;
         if (ctx->cliprdr->Open(ctx->cliprdr) != CHANNEL_RC_OK) {
             rdp_verbose("clipboard channel open failed");
@@ -450,17 +474,23 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->cliprdr) { rdp_verbose("no clipboard channel"); return false; }
 
+    /* Store an owned copy of the host clipboard; we hand it to the client only
+     * when it sends a Format Data Request. Advertising data unsolicited (the
+     * old behaviour) violates MS-RDPECLIP and clients ignore it. */
+    free(ctx->clipData);
+    ctx->clipData = (uint8_t *)malloc(len);
+    if (!ctx->clipData) { ctx->clipLen = 0; return false; }
+    memcpy(ctx->clipData, data, len);
+    ctx->clipLen    = len;
+    ctx->clipFormat = format;
+
+    /* Advertise the available format; the client requests the bytes on paste. */
     CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = NULL };
     CLIPRDR_FORMAT_LIST list = {0};
     list.common.msgFlags = CB_RESPONSE_OK;
     list.numFormats      = 1;
     list.formats         = &fmt;
     ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
-
-    CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
-    resp.common.msgFlags      = CB_RESPONSE_OK;
-    resp.common.dataLen       = (UINT32)len;
-    resp.requestedFormatData  = (BYTE *)data;
-    ctx->cliprdr->ServerFormatDataResponse(ctx->cliprdr, &resp);
+    rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
     return true;
 }

@@ -47,18 +47,24 @@
             }
             if (status != kCGDisplayStreamFrameStatusFrameComplete || !frameSurface) return;
 
-            weak.frameCount++;
-            if (weak.frameCount % 300 == 0)
-                rdp_verbose("capture: %llu frames delivered", (unsigned long long)weak.frameCount);
-
+            /* Dirty-rect gate: skip encode entirely when nothing changed.
+               On a static screen this saves 100% of encode CPU at idle. */
             size_t rectCount = 0;
             const CGRect *rects = CGDisplayStreamUpdateGetRects(
                 updateRef, kCGDisplayStreamUpdateDirtyRects, &rectCount);
-            CGRect dirty = CGRectZero;
-            for (size_t i = 0; i < rectCount; i++)
+            if (rectCount == 0) {
+                rdp_debug("capture: frame skipped (no dirty rects)");
+                return;
+            }
+
+            weak.frameCount++;
+            if (weak.frameCount % 300 == 0)
+                rdp_verbose("capture: %llu frames encoded", (unsigned long long)weak.frameCount);
+
+            /* Compute dirty union for callers that want it. */
+            CGRect dirty = rects[0];
+            for (size_t i = 1; i < rectCount; i++)
                 dirty = CGRectUnion(dirty, rects[i]);
-            if (CGRectIsEmpty(dirty))
-                dirty = CGRectMake(0, 0, width, height);
 
             rdp_debug("frame dirty=(%.0f,%.0f,%.0fx%.0f) rects=%zu",
                       dirty.origin.x, dirty.origin.y,

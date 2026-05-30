@@ -8,6 +8,7 @@
 #import "audio/AudioCapture.h"
 #import "audio/AudioRedirect.h"
 #import <unistd.h>
+#include <freerdp/freerdp.h>
 #define RDP_LOG_COMPONENT "session"
 #include "logging/RDPLog.h"
 
@@ -126,7 +127,7 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
 
     rdp_info("setting up display %ux%u for %s", width, height, _address.UTF8String);
 
-    _display = [[VirtualDisplay alloc] initWithWidth:width height:height hiDPI:NO];
+    _display = [[VirtualDisplay alloc] initWithWidth:width height:height];
     if (![_display create]) {
         rdp_verbose("VirtualDisplay unavailable, falling back to main display");
         _display = nil;
@@ -166,17 +167,25 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     };
     [_clipboard start];
 
-    _audio = [[AudioCapture alloc] init];
-    _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
-        rdp_debug("audio: %u frames", frameCount);
-        rdp_peer_send_audio(weak.peer, samples, frameCount);
-    };
-    NSError *audioErr = nil;
-    if (![_audio startWithError:&audioErr]) {
-        rdp_verbose("audio capture unavailable: %s",
-                    audioErr.localizedDescription.UTF8String);
+    /* Only start audio capture if the client actually declared audio support.
+       Saves a CoreAudio IO proc registration for clients that don't want audio. */
+    BOOL clientWantsAudio = freerdp_settings_get_bool(
+        _peer->context->settings, FreeRDP_AudioPlayback);
+    if (clientWantsAudio) {
+        _audio = [[AudioCapture alloc] init];
+        _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
+            rdp_debug("audio: %u frames", frameCount);
+            rdp_peer_send_audio(weak.peer, samples, frameCount);
+        };
+        NSError *audioErr = nil;
+        if (![_audio startWithError:&audioErr]) {
+            rdp_verbose("audio capture unavailable: %s",
+                        audioErr.localizedDescription.UTF8String);
+        } else {
+            rdp_verbose("audio capture started");
+        }
     } else {
-        rdp_verbose("audio capture started");
+        rdp_verbose("client did not request audio — capture skipped");
     }
 
     _sessionState = RDPSessionStateActive;

@@ -140,9 +140,12 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     _encoder = [[FrameEncoder alloc] initWithWidth:width height:height
                                            bitrate:kDefaultBitrate];
     __weak typeof(self) weak = self;
-    _encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame) {
-        rdp_debug("encoded frame: len=%zu keyFrame=%d", len, keyFrame);
-        rdp_peer_send_h264_frame(weak.peer, data, len, width, height);
+    _encoder.outputHandler = ^(const uint8_t *data, size_t len, BOOL keyFrame,
+                               uint16_t dx, uint16_t dy, uint16_t dw, uint16_t dh) {
+        rdp_debug("encoded frame: len=%zu keyFrame=%d dirty=(%u,%u,%ux%u)",
+                  len, keyFrame, dx, dy, dw, dh);
+        rdp_peer_send_h264_frame(weak.peer, data, len, width, height,
+                                 keyFrame ? true : false, dx, dy, dw, dh);
     };
     [_encoder start];
     rdp_verbose("H.264 encoder started at %u kbps", kDefaultBitrate);
@@ -151,10 +154,13 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     _capture.frameHandler = ^(IOSurfaceRef surface, uint32_t fw, uint32_t fh,
                                CGRect dirty) {
         (void)fw; (void)fh;
-        rdp_debug("captured frame: dirty=(%.0f,%.0f,%.0fx%.0f)",
-                  dirty.origin.x, dirty.origin.y,
-                  dirty.size.width, dirty.size.height);
-        [weak.encoder encodeFrame:surface];
+        /* Clamp the dirty origin/size to UINT16 surface-pixel coordinates. */
+        uint16_t dx = (uint16_t)MAX(0.0, dirty.origin.x);
+        uint16_t dy = (uint16_t)MAX(0.0, dirty.origin.y);
+        uint16_t dw = (uint16_t)MIN((double)width,  dirty.size.width);
+        uint16_t dh = (uint16_t)MIN((double)height, dirty.size.height);
+        rdp_debug("captured frame: dirty=(%u,%u,%ux%u)", dx, dy, dw, dh);
+        [weak.encoder encodeFrame:surface dirtyX:dx dirtyY:dy dirtyW:dw dirtyH:dh];
     };
     [_capture startWithWidth:width height:height];
     rdp_verbose("screen capture started on displayID=%u", displayID);

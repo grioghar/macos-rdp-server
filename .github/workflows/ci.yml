@@ -1,0 +1,81 @@
+name: CI Build Check
+
+# Fast compile validation on every push/PR to master. arm64-only, no release.
+# Reuses the cached fork-built FreeRDP from the release workflow.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build-check:
+    name: Compile check (arm64)
+    runs-on: macos-14
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          brew install cmake ninja pkg-config openssl@3
+          echo "OPENSSL_ROOT=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
+
+      - name: Read FreeRDP version
+        id: freerdp-ver
+        run: echo "ver=$(tr -d '[:space:]' < .github/freerdp-version)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FreeRDP static build
+        id: cache-freerdp
+        uses: actions/cache@v4
+        with:
+          path: ~/freerdp-install
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v6-fork
+
+      - name: Build FreeRDP (static, fork branch)
+        if: steps.cache-freerdp.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          SRC="$RUNNER_TEMP/freerdp-src"
+          INSTALL="$HOME/freerdp-install"
+          git clone --depth 1 --branch "build/3.10.3-patched" \
+            https://github.com/grioghar/FreeRDP.git "$SRC"
+          cmake -S "$SRC" -B "$SRC/build" -G Ninja \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_C_FLAGS="-Os" -DCMAKE_CXX_FLAGS="-Os" \
+            -DCMAKE_INSTALL_PREFIX="$INSTALL" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
+            -DCMAKE_PREFIX_PATH="$OPENSSL_ROOT" \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_SERVER=ON -DWITH_PLATFORM_SERVER=OFF \
+            -DWITH_CLIENT=OFF -DWITH_CLIENT_COMMON=OFF -DWITH_PROXY=OFF \
+            -DWITH_SHADOW=OFF -DWITH_SAMPLE=OFF -DWITH_WINPR_TOOLS=OFF \
+            -DWITH_FFMPEG=OFF -DWITH_SWSCALE=OFF -DWITH_DSP_FFMPEG=OFF \
+            -DWITH_CAIRO=OFF -DWITH_OPUS=OFF -DWITH_RDTK=OFF \
+            -DWITH_WAYLAND=OFF -DWITH_X11=OFF -DWITH_CUPS=OFF -DWITH_PCSC=OFF \
+            -DWITH_JPEG=OFF -DWITH_WEBP=OFF -DWITH_OSS=OFF -DWITH_ALSA=OFF -DWITH_PULSE=OFF \
+            -DWITH_CHANNELS=ON -DWITH_RDPSND=ON -DWITH_CLIPRDR=ON -DWITH_RDPGFX=ON \
+            -DWITH_RDPEI=OFF -DWITH_RDPDR=OFF -DWITH_PRINTER=OFF -DWITH_SMARTCARD=OFF \
+            -DWITH_SERIAL=OFF -DWITH_PARALLEL=OFF -DWITH_URBDRC=OFF \
+            -DWITH_VIDEO_ENCODER=OFF -DWITH_NEON=OFF -DBUILD_TESTING=OFF \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
+          cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
+          cmake --install "$SRC/build"
+
+      - name: Compile macos-rdp-daemon
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
+            -DMACOS_RDP_STATIC=ON \
+            -DFREERDP_STATIC_INSTALL="$HOME/freerdp-install" \
+            -DCMAKE_PREFIX_PATH="$HOME/freerdp-install;$OPENSSL_ROOT" \
+            -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
+          cmake --build build --parallel "$(sysctl -n hw.logicalcpu)"
+          file build/macos-rdp-daemon

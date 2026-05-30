@@ -355,18 +355,50 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
 
 bool rdp_peer_send_h264_frame(freerdp_peer *peer,
                                const uint8_t *data, size_t len,
-                               uint32_t width, uint32_t height) {
+                               uint32_t width, uint32_t height,
+                               bool isKeyFrame,
+                               uint16_t dirtyX, uint16_t dirtyY,
+                               uint16_t dirtyW, uint16_t dirtyH) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
 
-    RECTANGLE_16 rect = {0, 0, (UINT16)width, (UINT16)height};
+    /* Build the damage region. Keyframes refresh the whole surface, so they
+     * must claim the full extent; inter-frames claim only the dirty rect.
+     * Align to 16px macroblock boundaries and clamp to surface bounds — the
+     * AVC420 region must lie within the decoded picture or the client rejects it. */
+    RECTANGLE_16 rect;
+    if (isKeyFrame || dirtyW == 0 || dirtyH == 0) {
+        rect.left = 0; rect.top = 0;
+        rect.right = (UINT16)width; rect.bottom = (UINT16)height;
+    } else {
+        uint32_t left   = dirtyX & ~15u;                 /* round down to 16 */
+        uint32_t top    = dirtyY & ~15u;
+        uint32_t right  = (dirtyX + dirtyW + 15u) & ~15u; /* round up to 16 */
+        uint32_t bottom = (dirtyY + dirtyH + 15u) & ~15u;
+        if (right  > width)  right  = width;
+        if (bottom > height) bottom = height;
+        if (left   >= right)  { left = 0; right = (uint32_t)width; }
+        if (top    >= bottom) { top = 0;  bottom = (uint32_t)height; }
+        rect.left = (UINT16)left;  rect.top = (UINT16)top;
+        rect.right = (UINT16)right; rect.bottom = (UINT16)bottom;
+    }
+
+    /* quantQualityVals MUST be a valid parallel array — the server serializer
+     * dereferences quantQualityVals[i] for every region rect. NULL crashes.
+     * qp is a quality hint (QoE only, not decode-critical); qualityVal mirrors
+     * FreeRDP's own encoder: 100 - (qp & 0x3F). */
+    RDPGFX_H264_QUANT_QUALITY quant = {0};
+    quant.qp         = 26;
+    quant.qualityVal = (BYTE)(100 - (26 & 0x3F));
+
     RDPGFX_AVC420_BITMAP_STREAM avc = {0};
     avc.data                  = (BYTE *)data;
     avc.length                = (UINT32)len;
     avc.meta.numRegionRects   = 1;
     avc.meta.regionRects      = &rect;
-    avc.meta.quantQualityVals = NULL;
+    avc.meta.quantQualityVals = &quant;
 
+    /* The H.264 picture is full-surface, so the destination extent is too. */
     RDPGFX_SURFACE_COMMAND cmd = {0};
     cmd.surfaceId = ctx->surfaceId;
     cmd.codecId   = RDPGFX_CODECID_AVC420;
@@ -379,6 +411,9 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
 
     UINT rc = ctx->gfx->SurfaceCommand(ctx->gfx, &cmd);
     if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceCommand failed: %u", rc); return false; }
+    rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
+              isKeyFrame ? "key" : "delta",
+              rect.left, rect.top, rect.right, rect.bottom, len);
     return true;
 }
 

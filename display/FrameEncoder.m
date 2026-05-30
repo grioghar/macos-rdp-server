@@ -18,6 +18,22 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
                          OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer);
 
+/* Pack/unpack a damage rect into the pointer-sized VT sourceFrameRefCon.
+ * void* is 64-bit on every target arch, so four UINT16 fit exactly — this
+ * carries the dirty rect to the (async) output callback with zero allocation
+ * and no shared-state race. */
+static inline void *pack_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
+    uintptr_t p = (uintptr_t)x | ((uintptr_t)y << 16) |
+                  ((uintptr_t)w << 32) | ((uintptr_t)h << 48);
+    return (void *)p;
+}
+static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
+                                uint16_t *w, uint16_t *h) {
+    uintptr_t p = (uintptr_t)refcon;
+    *x = (uint16_t)(p);       *y = (uint16_t)(p >> 16);
+    *w = (uint16_t)(p >> 32); *h = (uint16_t)(p >> 48);
+}
+
 @implementation FrameEncoder
 
 - (instancetype)initWithWidth:(uint32_t)width height:(uint32_t)height
@@ -58,7 +74,9 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
     return YES;
 }
 
-- (void)encodeFrame:(IOSurfaceRef)surface {
+- (void)encodeFrame:(IOSurfaceRef)surface
+             dirtyX:(uint16_t)dirtyX dirtyY:(uint16_t)dirtyY
+             dirtyW:(uint16_t)dirtyW dirtyH:(uint16_t)dirtyH {
     if (!_session || !surface) return;
     CVPixelBufferRef pixbuf = NULL;
     CVReturn cvErr = CVPixelBufferCreateWithIOSurface(kCFAllocatorDefault,
@@ -68,8 +86,9 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
         return;
     }
     CMTime pts = CMTimeMake(_frameIndex++, 60);
+    void *refcon = pack_rect(dirtyX, dirtyY, dirtyW, dirtyH);
     VTCompressionSessionEncodeFrame(_session, pixbuf, pts, kCMTimeInvalid,
-                                    NULL, NULL, NULL);
+                                    NULL, refcon, NULL);
     CVPixelBufferRelease(pixbuf);
 }
 
@@ -83,8 +102,11 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
     _session = NULL;
 }
 
-- (void)handleSampleBuffer:(CMSampleBufferRef)buf {
+- (void)handleSampleBuffer:(CMSampleBufferRef)buf
+                  dirtyRect:(void *)refcon {
     if (!CMSampleBufferDataIsReady(buf)) return;
+    uint16_t dx, dy, dw, dh;
+    unpack_rect(refcon, &dx, &dy, &dw, &dh);
 
     BOOL isKey = NO;
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(buf, FALSE);
@@ -130,7 +152,8 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
     rdp_debug("encoded %zu bytes (key=%d frame=%lld)", annexB.length, isKey, _frameIndex);
 
     FrameEncoderOutputBlock handler = self.outputHandler;
-    if (handler) handler((const uint8_t *)annexB.bytes, annexB.length, isKey);
+    if (handler) handler((const uint8_t *)annexB.bytes, annexB.length, isKey,
+                         dx, dy, dw, dh);
 }
 
 @end
@@ -138,11 +161,12 @@ static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
                          OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer) {
-    (void)sourceFrameRefCon; (void)infoFlags;
+    (void)infoFlags;
     if (status != noErr) {
         rdp_error("VT encode callback error: %d", (int)status);
         return;
     }
     if (!sampleBuffer) return;
-    [(__bridge FrameEncoder *)outputCallbackRefCon handleSampleBuffer:sampleBuffer];
+    [(__bridge FrameEncoder *)outputCallbackRefCon handleSampleBuffer:sampleBuffer
+                                                            dirtyRect:sourceFrameRefCon];
 }

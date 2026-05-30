@@ -14,6 +14,11 @@ on:
       tag:
         description: 'Release tag (e.g. v0.1.3)'
         required: true
+      enable_nla:
+        description: 'Build with NLA/CredSSP authentication (-DMACOS_RDP_ENABLE_NLA=ON)'
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: write   # required for gh release create to upload assets
@@ -42,7 +47,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/ossl-universal
-          key: openssl-${{ steps.ver.outputs.openssl }}-universal-static-v1
+          # v2: also ship the legacy + common provider archives (NTLM MD4/RC4/DES)
+          key: openssl-${{ steps.ver.outputs.openssl }}-universal-static-v2
 
       - name: Build universal OpenSSL from source
         if: steps.cache-openssl.outputs.cache-hit != 'true'
@@ -61,24 +67,36 @@ jobs:
               ./Configure "$target" no-shared no-tests no-docs no-apps \
                   --libdir=lib --prefix="$prefix"
               make -j"$JOBS" >/dev/null
-              make install_dev >/dev/null )
+              make install_dev >/dev/null
+              # The legacy provider (NTLM needs MD4/RC4/DES) builds as static
+              # archives under providers/ but install_dev does not install them.
+              # Copy them in so NLA builds can link them.
+              cp providers/liblegacy.a providers/libcommon.a "$prefix/lib/" 2>/dev/null || true )
           }
           build_arch darwin64-arm64-cc  "$RUNNER_TEMP/ossl-arm64"  "$RUNNER_TEMP/ossl-src-arm64"
           build_arch darwin64-x86_64-cc "$RUNNER_TEMP/ossl-x86_64" "$RUNNER_TEMP/ossl-src-x86_64"
 
           # Merge thin slices into universal fat archives; headers are
-          # identical for both LP64 darwin targets, so take arm64's.
+          # identical for both LP64 darwin targets, so take arm64's. liblegacy /
+          # libcommon are merged too when present (needed only for NLA builds).
           U="$HOME/ossl-universal"
           mkdir -p "$U/lib" "$U/include"
           cp -R "$RUNNER_TEMP/ossl-arm64/include/." "$U/include/"
-          for lib in libssl libcrypto; do
+          LIBS="libssl libcrypto"
+          for extra in liblegacy libcommon; do
+            if [[ -f "$RUNNER_TEMP/ossl-arm64/lib/$extra.a" \
+               && -f "$RUNNER_TEMP/ossl-x86_64/lib/$extra.a" ]]; then
+              LIBS="$LIBS $extra"
+            fi
+          done
+          for lib in $LIBS; do
             lipo -create \
               "$RUNNER_TEMP/ossl-arm64/lib/$lib.a" \
               "$RUNNER_TEMP/ossl-x86_64/lib/$lib.a" \
               -output "$U/lib/$lib.a"
           done
           echo "== universal OpenSSL archives =="
-          lipo -info "$U/lib/libssl.a" "$U/lib/libcrypto.a"
+          lipo -info "$U/lib/"*.a
 
       - name: Export OpenSSL root
         run: echo "OPENSSL_ROOT=$HOME/ossl-universal" >> "$GITHUB_ENV"
@@ -124,13 +142,23 @@ jobs:
 
       # ── Daemon: one universal cmake pass ──
       - name: Build macos-rdp-daemon (universal)
+        env:
+          ENABLE_NLA: ${{ github.event.inputs.enable_nla }}
         run: |
           set -euo pipefail
+          # NLA is opt-in via workflow_dispatch; tag-triggered releases build the
+          # default (TLS, no auth) so the production release path is unchanged.
+          NLA_FLAG=""
+          if [[ "${ENABLE_NLA:-false}" == "true" ]]; then
+            NLA_FLAG="-DMACOS_RDP_ENABLE_NLA=ON"
+            echo "Building with NLA/CredSSP enabled"
+          fi
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
             -DMACOS_RDP_STATIC=ON \
+            $NLA_FLAG \
             -DFREERDP_STATIC_INSTALL="$HOME/freerdp-install" \
             -DCMAKE_PREFIX_PATH="$HOME/freerdp-install;$OPENSSL_ROOT" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE

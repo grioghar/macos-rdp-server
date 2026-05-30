@@ -1,0 +1,32 @@
+diff --git a/channels/rdpsnd/server/rdpsnd_main.c b/channels/rdpsnd/server/rdpsnd_main.c
+index 390b6a74e..2d1753bd5 100644
+--- a/channels/rdpsnd/server/rdpsnd_main.c
++++ b/channels/rdpsnd/server/rdpsnd_main.c
+@@ -256,7 +256,13 @@ static UINT rdpsnd_server_recv_formats(RdpsndServerContext* context, wStream* s)
+ 		}
+ 	}
+ 
+-	if (!context->num_client_formats)
++	/* Fix (backport): this guard is meant to reject clients that advertised
++	 * formats but none we recognise. It must test num_known_format (counted in
++	 * the loop above) — testing num_client_formats here is dead code, since it
++	 * was already proven non-zero before the loop and is never changed, so a
++	 * client offering only wFormatTag==0 formats would otherwise pass with zero
++	 * usable formats. */
++	if (!num_known_format)
+ 	{
+ 		WLog_ERR(TAG, "client doesn't support any known format!");
+ 		goto out_free;
+@@ -506,7 +512,11 @@ static UINT rdpsnd_server_send_wave_pdu(RdpsndServerContext* context, UINT16 wTi
+ 	UINT error = CHANNEL_RC_OK;
+ 	wStream* s = rdpsnd_server_get_buffer(context);
+ 
+-	if (context->selected_client_format > context->num_client_formats)
++	/* Fix (backport): valid indices are 0 .. num_client_formats-1. The sibling
++	 * send paths all use ">="; this one used ">", an off-by-one that indexes
++	 * client_formats[num_client_formats] (out-of-bounds read) when the two are
++	 * equal. */
++	if (context->selected_client_format >= context->num_client_formats)
+ 		return ERROR_INTERNAL_ERROR;
+ 
+ 	WINPR_ASSERT(context->client_formats);

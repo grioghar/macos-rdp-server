@@ -179,6 +179,96 @@ under the lock).
 3. **E2** is a worthwhile latency + CPU win for audio and needs no fork change.
 4. **E1** confirms there's no ZGFX compression win to chase — leave it.
 
-> Not yet verified: whether A–D are already fixed in FreeRDP `master`/3.11+. That
-> determines whether the fix is "bump the pin" or "carry a patch." Worth checking
-> before patching the fork.
+---
+
+# Second pass — upstream status, fix patches, and the security headline
+
+## Upstream status of A–D (checked against FreeRDP `master`, current 3.26.0)
+
+The pinned FreeRDP is **3.10.3**; upstream is now **3.26.0** (~16 minor releases
+ahead). Status of each finding in `master`:
+
+| Finding | In master? | Remediation |
+|---|---|---|
+| A — cliprdr capability heap overflow | **Fixed** (length validation added) | Bump the pin, or apply patch `0001` |
+| B — cliprdr `dataLen` DoS | **Fixed** (read path refactored) | Bump the pin, or apply patch `0001` |
+| C — rdpsnd off-by-one (`>` vs `>=`) | **Still present in 3.26** | Patch `0002` required; report upstream |
+| D — rdpsnd dead format check | **Still present in 3.26** | Patch `0002` required; report upstream |
+
+So A and B argue for **bumping the FreeRDP pin**; C and D are not fixed upstream
+and need the carried patch regardless. Ready-to-apply backports for all four are
+in **`patches/freerdp/`** (verified to apply cleanly to `build/3.10.3-patched`).
+
+## Other audited surface (second pass)
+
+- **rdpgfx server *receive* parsers — clean.** The count-driven client parsers
+  (`recv_cache_import_offer_pdu`, `recv_caps_advertise_pdu`,
+  `recv_frame_acknowledge`, `recv_qoe_frame_acknowledge`) are properly bounded:
+  counts are capped before use, `calloc`/fixed-array element sizes match the
+  indexed type, and variable advances use `Stream_SafeSeek`. Only a
+  defense-in-depth note: `rdpgfx_server_receive_pdu` does
+  `Stream_SetPosition(s, beg + header.pduLength)` trusting `rdpgfx_read_header`
+  (in `rdpgfx_common.c`) to have validated `pduLength` against the remaining
+  length — worth an explicit clamp. (It's the *send* path the fork patched; the
+  recv path is upstream-standard and solid.)
+- **drdynvc *server* channel — a stub, not on the app's path.** Its worker loop
+  is `#if 0`'d out and the thread just `ExitThread(0)`; it does no PDU parsing.
+  The app drives the real DVC state machine through the WTS manager in libfreerdp
+  core (`WTSVirtualChannelManagerGetDrdynvcState` / `...CheckFileDescriptor`),
+  not this context — so there's no parsing attack surface here. Minor: the stub
+  leaks its channel handle on the `start` error path.
+
+## 🔴 Security headline — no authentication in front of these parsers
+
+The findings above are reachable because of how the app configures RDP security
+in `protocol/RDPPeer.c:77-81`:
+
+```c
+FreeRDP_UseRdpSecurityLayer = FALSE
+FreeRDP_RdpSecurity         = TRUE      // legacy "Standard RDP Security" still offered
+FreeRDP_TlsSecurity         = TRUE
+FreeRDP_NlaSecurity         = FALSE     // NLA/CredSSP disabled
+FreeRDP_TlsSecLevel         = 1         // permits weaker/legacy crypto vs default 2
+```
+
+Consequences (all confirmed by reading the code):
+
+1. **Zero authentication before channel data is parsed.** No
+   `FreeRDP_Authentication`, no credentials, no `peer->Authenticate` callback.
+   The channel servers are opened in `peer_post_connect` (`RDPPeer.c:270,286,315`)
+   — immediately after the handshake — so any client that completes a TLS (or
+   legacy-RDP) handshake reaches the cliprdr/rdpsnd/gfx parsers **and** the
+   keyboard/mouse injector (`RDPPeer.c:119-138` → `InputInjector`). An
+   unauthenticated client gets full input control of the macOS session.
+2. **`RdpSecurity = TRUE` offers the legacy Standard RDP Security layer** with no
+   `EncryptionLevel`/`EncryptionMethods` set — an implicit weak/no-TLS path. This
+   also means a missing/broken cert may not reliably refuse a connection.
+3. **`peer_load_certificate()`'s return value is ignored** (`RDPPeer.c:88`):
+   `peer_apply_settings` proceeds even if the cert/key fail to load.
+4. **Exposure amplifiers:** the daemon runs as **root** (launchd plist), binds
+   **all interfaces** (`in6addr_any`, `RDPServer.m`), on port **3389**. The TLS
+   key is self-signed, trust-on-first-use, and stored **unencrypted** (`-nodes`)
+   with no pinning.
+
+Net: an unauthenticated network attacker can reach the cliprdr heap overflow
+(Finding A) *and* drive keyboard/mouse in a root-launched session. **Patching
+A–D is necessary but not sufficient** — the configuration itself is the larger
+risk.
+
+## Consolidated remediation priorities
+
+| Pri | Action | Where |
+|---|---|---|
+| **P0** | Add authentication before channel data: re-enable NLA (fix the OpenSSL/NTLM build dependency that motivated disabling it) or gate channel-open + input callbacks behind an app credential check | `RDPPeer.c:80`, `:119-138`, `:270/286/315` |
+| **P0** | Stop offering legacy RDP security; set `RdpSecurity = FALSE` and an explicit `EncryptionLevel` so only TLS(+NLA) is negotiable | `RDPPeer.c:78` |
+| **P1** | Honor `peer_load_certificate()` failure — abort peer creation instead of proceeding | `RDPPeer.c:88` |
+| **P1** | Restrict the listener to loopback / a private interface unless remote access is required | `RDPServer.m`, launchd plist |
+| **P1** | Bump the FreeRDP pin (fixes A & B) **and** carry patch `0002` (C & D, unfixed upstream) | `.github/freerdp-version`, `patches/freerdp/` |
+| **P2** | Raise `TlsSecLevel` to 2; protect the private key (Keychain or encrypted at rest); publish the cert fingerprint for client pinning | `RDPPeer.c:81`, `scripts/gen-tls-cert.sh` |
+| **P2** | App-side audio: send PCM directly (E2) and lock `selected_client_format` (E3) | `RDPPeer.c` rdpsnd setup |
+| — | Report C & D upstream (present in master) | FreeRDP |
+
+The memory-safety items (A–D) ship as ready patches in `patches/freerdp/`. The
+security-config items (P0–P1) are app-side changes in this repo and are the
+higher-leverage fix; they're left as recommendations pending your call on the
+NLA/OpenSSL-NTLM trade-off.

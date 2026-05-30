@@ -78,7 +78,7 @@ On first connect your client will show a certificate trust prompt — accept it.
 
 ## Privacy permissions
 
-On first run, macOS will block Screen Recording and Accessibility access. Grant both in **System Settings → Privacy & Security**:
+macOS gates the daemon's capabilities behind Privacy & Security:
 
 | Permission | Required for |
 |---|---|
@@ -86,9 +86,21 @@ On first run, macOS will block Screen Recording and Accessibility access. Grant 
 | Accessibility | `CGEventPost` keyboard & mouse injection |
 | Microphone | CoreAudio system audio tap |
 
+The installer opens the relevant panes automatically. To (re)run the helper:
+
 ```bash
-# Or pre-grant from an admin terminal (requires SIP off):
-sudo bash scripts/grant-permissions.sh
+curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/grant-permissions.sh | sudo bash
+```
+
+What it does:
+- **SIP enabled** (default): opens the **Screen Recording** and **Accessibility** panes. Click **+ → Cmd-Shift-G → `/usr/local/sbin`**, select `macos-rdp-daemon`, and toggle it on. (Once an RDP client has connected once, the binary registers itself in these lists, so you can just flip the switch.)
+- **SIP disabled**: grants both permissions directly by writing the system TCC database, then restarts the daemon — no clicking.
+
+> macOS does not allow any tool to grant Screen Recording / Accessibility programmatically while SIP is on — that restriction is the whole point of TCC. The helper makes the manual step as close to one click as the OS permits. Fully unattended granting requires [disabling SIP](docs/no-signing.md).
+
+After enabling both, restart the service:
+```bash
+sudo launchctl kickstart -k system/com.macosrdp.daemon
 ```
 
 ## Configuration

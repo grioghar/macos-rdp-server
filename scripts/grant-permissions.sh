@@ -45,9 +45,30 @@ open_pane() {  # open a Privacy pane as the logged-in user (root can't open GUI)
             open "x-apple.systempreferences:com.apple.preference.security?$anchor" 2>/dev/null
 }
 
+# Return 0 if BOTH Screen Recording and Accessibility are already granted.
+# Prefer the binary's own preflight check (official APIs, no Full Disk Access
+# needed); only use it when the binary advertises the flag so an older build
+# that ignores it and starts the server can't hang us. Else read the TCC DB.
+perms_ok() {
+    if "$BINARY" --help 2>&1 | grep -q -- "--check-permissions"; then
+        "$BINARY" --check-permissions >/dev/null 2>&1
+        return $?
+    fi
+    local s a
+    s=$(sqlite3 "$TCC_SYS" "SELECT auth_value FROM access WHERE service='kTCCServiceScreenCapture' AND client='$BINARY' LIMIT 1;" 2>/dev/null)
+    a=$(sqlite3 "$TCC_SYS" "SELECT auth_value FROM access WHERE service='kTCCServiceAccessibility'  AND client='$BINARY' LIMIT 1;" 2>/dev/null)
+    [[ "$s" == "2" && "$a" == "2" ]]
+}
+
 echo ""
 log "macos-rdp-daemon Privacy permissions helper"
 echo ""
+
+if perms_ok; then
+    log "Screen Recording and Accessibility are already granted — nothing to do."
+    launchctl kickstart -k "system/$LABEL" 2>/dev/null || true
+    exit 0
+fi
 
 if sip_on; then
     warn "System Integrity Protection is ENABLED."

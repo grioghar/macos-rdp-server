@@ -1,4 +1,6 @@
 #import <Foundation/Foundation.h>
+#import <CoreGraphics/CoreGraphics.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <syslog.h>
 #import <signal.h>
 #import <sys/event.h>
@@ -7,6 +9,18 @@
 #import "daemon/RDPSession.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
+
+/* Report this binary's TCC permission state using the official preflight APIs
+ * (no Full Disk Access or TCC.db poking needed — they answer for this exact
+ * binary's identity). Prints a parseable summary; exits 0 only if BOTH are
+ * granted, so scripts can gate on the exit code. */
+static int check_permissions(void) {
+    BOOL screen = CGPreflightScreenCaptureAccess();
+    BOOL access = AXIsProcessTrusted();
+    fprintf(stdout, "screen_recording=%s\n", screen ? "granted" : "denied");
+    fprintf(stdout, "accessibility=%s\n",    access ? "granted" : "denied");
+    return (screen && access) ? 0 : 1;
+}
 
 @interface AppDelegate : NSObject <RDPServerDelegate>
 @end
@@ -31,8 +45,9 @@
 static void print_usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  --port <n>       TCP port to listen on (default: 3389)\n"
-        "  --log-level <l>  error|info|verbose|debug (default: info)\n",
+        "  --port <n>            TCP port to listen on (default: 3389)\n"
+        "  --log-level <l>       error|info|verbose|debug (default: info)\n"
+        "  --check-permissions   report Screen Recording + Accessibility state, then exit\n",
         prog);
 }
 
@@ -55,6 +70,8 @@ int main(int argc, char *argv[]) {
                 int lvl = rdp_log_level_from_string(argv[++i]);
                 if (lvl >= 0) rdp_log_set_level((RDPLogLevel)lvl);
                 else { fprintf(stderr, "Unknown log level '%s'\n", argv[i]); return 1; }
+            } else if (strcmp(argv[i], "--check-permissions") == 0) {
+                return check_permissions();
             } else if (strcmp(argv[i], "--help") == 0) {
                 print_usage(argv[0]); return 0;
             }

@@ -144,9 +144,25 @@ elif ! launchctl load -w "$PLIST_DEST" 2>/dev/null; then
     warn "load it manually: sudo launchctl bootstrap system $PLIST_DEST"
 fi
 
-# ── Privacy permissions — open the panes now to make granting one-click ───
+# ── Privacy permissions — only prompt if not already granted ──────────────
+TCC_SYS="/Library/Application Support/com.apple.TCC/TCC.db"
+perms_ok() {
+    if "$BINARY_DEST" --help 2>&1 | grep -q -- "--check-permissions"; then
+        "$BINARY_DEST" --check-permissions >/dev/null 2>&1
+        return $?
+    fi
+    local s a
+    s=$(sqlite3 "$TCC_SYS" "SELECT auth_value FROM access WHERE service='kTCCServiceScreenCapture' AND client='$BINARY_DEST' LIMIT 1;" 2>/dev/null)
+    a=$(sqlite3 "$TCC_SYS" "SELECT auth_value FROM access WHERE service='kTCCServiceAccessibility'  AND client='$BINARY_DEST' LIMIT 1;" 2>/dev/null)
+    [[ "$s" == "2" && "$a" == "2" ]]
+}
+
 REAL_USER="$(stat -f%Su /dev/console 2>/dev/null || echo "${SUDO_USER:-}")"
-if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+PERMS_ALREADY_OK=false
+if perms_ok; then
+    PERMS_ALREADY_OK=true
+    log "Screen Recording + Accessibility already granted — skipping the prompts."
+elif [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
     log "Opening the Privacy panes…"
     UID_N="$(id -u "$REAL_USER")"
     launchctl asuser "$UID_N" sudo -u "$REAL_USER" \
@@ -166,12 +182,16 @@ echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━
 echo ""
 echo "  Connect to: $IP"
 echo ""
-echo -e "${YELLOW}  ACTION REQUIRED — grant two Privacy permissions:${NC}"
-echo "    In the panes that just opened, click + → Cmd-Shift-G → /usr/local/sbin"
-echo "    → select macos-rdp-daemon, for BOTH Screen Recording and Accessibility."
-echo ""
-echo "  Helper (re-opens panes; auto-grants if SIP is disabled):"
-echo "    curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/grant-permissions.sh | sudo bash"
+if [[ "$PERMS_ALREADY_OK" == "true" ]]; then
+    echo -e "${GREEN}  Privacy permissions already granted — you're ready to connect.${NC}"
+else
+    echo -e "${YELLOW}  ACTION REQUIRED — grant two Privacy permissions:${NC}"
+    echo "    In the panes that just opened, click + → Cmd-Shift-G → /usr/local/sbin"
+    echo "    → select macos-rdp-daemon, for BOTH Screen Recording and Accessibility."
+    echo ""
+    echo "  Helper (skips if already granted; auto-grants if SIP is disabled):"
+    echo "    curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/grant-permissions.sh | sudo bash"
+fi
 echo ""
 echo "  Then:  sudo launchctl kickstart -k system/com.macosrdp.daemon"
 echo ""

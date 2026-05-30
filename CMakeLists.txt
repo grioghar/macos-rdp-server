@@ -89,6 +89,7 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework CoreAudio"
     "-framework AudioToolbox"
     "-framework AppKit"
+    "-framework ApplicationServices"
     "-framework IOKit"
     "-framework IOSurface"
     "-framework Security"

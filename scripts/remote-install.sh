@@ -21,9 +21,15 @@ major=$(sw_vers -productVersion | cut -d. -f1)
 
 log "macOS $(sw_vers -productVersion) · $(uname -m)"
 
+# /usr/local/sbin does not exist on a clean macOS — create it (and any other
+# destination dirs) up front so `install` can't fail on a missing parent.
+mkdir -p "$(dirname "$BINARY_DEST")" "$(dirname "$PLIST_DEST")"
+
 # ── Download pre-built universal binary from latest release ──────────────
-LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-         | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+# The `|| true` keeps a rate-limited / offline API response from aborting the
+# script under `set -e` — an empty LATEST falls through to the source build.
+LATEST=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+         | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/' || true)
 
 if [[ -n "$LATEST" ]]; then
     BIN_URL="https://github.com/$REPO/releases/download/$LATEST/macos-rdp-daemon"
@@ -87,8 +93,18 @@ fi
 log "Installing launchd service..."
 curl -fsSL "$RAW/launchd/com.macosrdp.daemon.plist" -o "$PLIST_DEST"
 chmod 644 "$PLIST_DEST"
-launchctl unload "$PLIST_DEST" 2>/dev/null || true
-launchctl load -w "$PLIST_DEST"
+chown root:wheel "$PLIST_DEST"
+
+# Prefer the modern bootstrap/bootout API (macOS 11+); fall back to legacy
+# load/unload on older systems. Neither failure should abort the install.
+launchctl bootout system "$PLIST_DEST" 2>/dev/null || \
+    launchctl unload "$PLIST_DEST" 2>/dev/null || true
+if launchctl bootstrap system "$PLIST_DEST" 2>/dev/null; then
+    launchctl enable system/com.macosrdp.daemon 2>/dev/null || true
+elif ! launchctl load -w "$PLIST_DEST" 2>/dev/null; then
+    warn "could not register the launchd service automatically"
+    warn "load it manually: sudo launchctl bootstrap system $PLIST_DEST"
+fi
 
 # ── Done ──────────────────────────────────────────────────────────────────
 IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<your-ip>')

@@ -142,7 +142,11 @@ jobs:
           lipo -info "$BIN" | grep -q "x86_64" || { echo "missing x86_64"; exit 1; }
           echo "== external deps =="
           otool -L "$BIN"
-          EXTERNAL=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/|@)' || true)
+          # Only tab-indented lines are dependencies. For a fat binary otool -L
+          # also prints an unindented "(architecture X):" header per slice, plus
+          # the binary-name header — those must NOT be treated as dependencies.
+          EXTERNAL=$(otool -L "$BIN" | grep -E '^[[:space:]]' | awk '{print $1}' \
+            | grep -Ev '^(/usr/lib/|/System/|@)' || true)
           if [[ -n "$EXTERNAL" ]]; then echo "Non-system deps: $EXTERNAL"; exit 1; fi
           strip -x "$BIN"
           ls -lh "$BIN"

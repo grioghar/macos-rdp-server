@@ -26,7 +26,7 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
 ```
 
-Downloads the latest pre-built **universal binary** (single file, runs natively on Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no dependencies.
+Downloads the latest pre-built **universal binary** (a single file that runs natively on both Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no runtime dependencies — the binary links only against macOS system frameworks.
 
 The script will:
 1. Download the universal binary to `/usr/local/sbin/macos-rdp-daemon`
@@ -40,7 +40,16 @@ sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/dow
   -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
 ```
 
+Verify the download against the published checksum:
+```bash
+curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/SHA256SUMS | shasum -c
+```
+
 After installation, open any RDP client and connect to your Mac's IP address.
+
+> **Reproducible builds.** Release binaries are built entirely from source-pinned forks
+> (FreeRDP and OpenSSL), statically linked, in a single CI pass. Nothing is pulled from a
+> package manager at build or run time. See [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ## Manual install
 

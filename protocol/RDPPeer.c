@@ -98,6 +98,7 @@ static void peer_apply_settings(freerdp_peer *peer) {
 
 static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
     RDPPeerContext *c = (RDPPeerContext *)ctx;
+    pthread_mutex_init(&c->gfxLock, NULL);
     /* Open the Virtual Channel Manager — all dynamic channels live under it. */
     c->vcm = WTSOpenServerA((LPSTR)peer->context);
     if (!c->vcm || c->vcm == INVALID_HANDLE_VALUE) {
@@ -116,6 +117,7 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
     if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
+    pthread_mutex_destroy(&c->gfxLock);
     rdp_debug("peer context freed");
 }
 
@@ -277,7 +279,15 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
     ctx->surfaceId          = 1;
-    rdp_verbose("GFX context created; open deferred until drdynvc ready");
+    /* External-thread mode: do NOT let GFX spawn its own thread. The default
+     * (ownThread=TRUE) runs an internal loop calling rdpgfx_server_handle_messages
+     * — which would race our run-loop's own handle_messages call and the encoder
+     * thread's SurfaceCommand on the shared send_stream/zgfx state (heap
+     * corruption / SIGABRT). With external mode WE are the sole driver, and a
+     * mutex serializes the run loop vs the encoder. */
+    if (ctx->gfx->Initialize)
+        ctx->gfx->Initialize(ctx->gfx, TRUE);
+    rdp_verbose("GFX context created (external-thread mode); open deferred");
 
     /* Clipboard. */
     ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
@@ -467,11 +477,15 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Drain GFX channel messages once the channel is open. */
+    /* Drain GFX channel messages once the channel is open. Serialized against
+     * the encoder thread's SurfaceCommand via gfxLock (shared send_stream/zgfx). */
     if (ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
-        if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0)
+        if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0) {
+            pthread_mutex_lock(&ctx->gfxLock);
             rdpgfx_server_handle_messages(ctx->gfx);
+            pthread_mutex_unlock(&ctx->gfxLock);
+        }
     }
 
     return true;
@@ -533,7 +547,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.data      = (BYTE *)data;
     cmd.extra     = &avc;
 
+    /* Serialize against the run-loop's handle_messages (shared GFX state). */
+    pthread_mutex_lock(&ctx->gfxLock);
     UINT rc = ctx->gfx->SurfaceCommand(ctx->gfx, &cmd);
+    pthread_mutex_unlock(&ctx->gfxLock);
     if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceCommand failed: %u", rc); return false; }
     rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
               isKeyFrame ? "key" : "delta",

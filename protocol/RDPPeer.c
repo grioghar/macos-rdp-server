@@ -69,8 +69,14 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_GfxSmallCache,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_GfxThinClient,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_RemoteFxCodec,           FALSE);
+    /* Security: match the known-good sample-server config. Crucially disable
+     * NLA — it requires NTLM/md4, which our minimal OpenSSL build omits (the
+     * "md4 NTLM support not available" log line). Offer TLS (+ legacy RDP as a
+     * fallback) so mstsc negotiates TLS. */
     freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             FALSE);
     freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,             1);
     freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,              32);
     freerdp_settings_set_bool(s,   FreeRDP_UnicodeInput,            TRUE);

@@ -119,7 +119,10 @@ cat > "$PLIST_DEST" <<'PLIST'
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
     <key>EnvironmentVariables</key>
-    <dict><key>RDP_LOG_LEVEL</key><string>info</string></dict>
+    <dict>
+        <key>HOME</key><string>/var/root</string>
+        <key>RDP_LOG_LEVEL</key><string>info</string>
+    </dict>
     <key>StandardOutPath</key><string>/var/log/macos-rdp-daemon.log</string>
     <key>StandardErrorPath</key><string>/var/log/macos-rdp-daemon.error.log</string>
     <key>ThrottleInterval</key><integer>5</integer>

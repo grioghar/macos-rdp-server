@@ -39,9 +39,13 @@
         </dict>
     </dict>
 
-    <!-- Set RDP_LOG_LEVEL=verbose or debug here for troubleshooting. -->
+    <!-- HOME is required: WinPR's WTSOpenServer resolves paths under it, and a
+         LaunchDaemon otherwise has none. Set RDP_LOG_LEVEL=verbose|debug to
+         troubleshoot. -->
     <key>EnvironmentVariables</key>
     <dict>
+        <key>HOME</key>
+        <string>/var/root</string>
         <key>RDP_LOG_LEVEL</key>
         <string>info</string>
     </dict>

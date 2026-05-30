@@ -40,6 +40,13 @@ int main(int argc, char *argv[]) {
     @autoreleasepool {
         openlog("macos-rdp-daemon", LOG_PID | LOG_NDELAY, LOG_DAEMON);
 
+        /* A LaunchDaemon starts with no HOME. WinPR's WTSOpenServer (used to
+         * create the virtual-channel manager) resolves paths under HOME, so a
+         * missing HOME makes freerdp_peer_context_new fail outright. Root's
+         * home is /var/root. Set TMPDIR too for any scratch-file paths. */
+        if (!getenv("HOME"))   setenv("HOME", "/var/root", 1);
+        if (!getenv("TMPDIR")) setenv("TMPDIR", "/var/tmp", 1);
+
         uint16_t port = 3389;
         for (int i = 1; i < argc; i++) {
             if (strcmp(argv[i], "--port") == 0 && i + 1 < argc) {

@@ -88,9 +88,12 @@ static const uint32_t kDefaultBitrate = 8000;
 static void rdp_on_ready(void *ud, uint32_t w, uint32_t h, uint32_t depth) {
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_info("client activated: %ux%u @%ubpp", w, h, depth);
-    dispatch_async(self.sessionQueue, ^{
-        [self setupDisplayAndMediaForWidth:w height:h];
-    });
+    /* Called from peer_activate INSIDE the peer loop, which already runs on the
+     * serial sessionQueue. dispatch_async back onto that same queue would starve
+     * this behind the blocking loop — it would only run after the loop exits and
+     * teardown has freed _peer (use-after-free crash), and media would never be
+     * set up during a live session. Run it inline: the peer is alive here. */
+    [self setupDisplayAndMediaForWidth:w height:h];
 }
 
 static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {

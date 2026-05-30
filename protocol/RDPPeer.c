@@ -239,15 +239,28 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         } else { rdp_verbose("clipboard channel opened"); }
     }
 
-    /* Audio — uses server_rdpsnd_get_formats to enumerate supported formats. */
+    /* Audio. Advertise ONLY raw PCM matching what AudioCapture produces
+     * (48 kHz, stereo, signed 16-bit). server_rdpsnd_get_formats would also
+     * offer compressed codecs (AAC/ADPCM/GSM); if one were negotiated, our
+     * raw-PCM SendSamples would feed the client undecodable garbage.
+     * Must be heap-allocated: rdpsnd_server_context_free() calls free() on
+     * server_formats, so a static array would crash on teardown. */
     ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
-        ctx->rdpsnd->data      = ctx;
-        ctx->rdpsnd->Activated = rdpsnd_activated;
-        ctx->rdpsnd->num_server_formats =
-            server_rdpsnd_get_formats(&ctx->rdpsnd->server_formats);
-        if (ctx->rdpsnd->num_server_formats > 0)
-            ctx->rdpsnd->src_format = &ctx->rdpsnd->server_formats[0];
+        AUDIO_FORMAT *pcm = (AUDIO_FORMAT *)calloc(1, sizeof(AUDIO_FORMAT));
+        if (pcm) {
+            pcm->wFormatTag      = WAVE_FORMAT_PCM;
+            pcm->nChannels       = 2;
+            pcm->nSamplesPerSec  = 48000;
+            pcm->nAvgBytesPerSec = 48000 * 2 * 2;
+            pcm->nBlockAlign     = 2 * 2;
+            pcm->wBitsPerSample  = 16;
+        }
+        ctx->rdpsnd->data               = ctx;
+        ctx->rdpsnd->Activated          = rdpsnd_activated;
+        ctx->rdpsnd->server_formats     = pcm;
+        ctx->rdpsnd->num_server_formats = pcm ? 1 : 0;
+        ctx->rdpsnd->src_format         = pcm;
         if (ctx->rdpsnd->Initialize(ctx->rdpsnd, TRUE) != CHANNEL_RC_OK) {
             rdp_verbose("audio channel init failed");
             rdpsnd_server_context_free(ctx->rdpsnd);

@@ -81,17 +81,52 @@ if [[ "${FROM_RELEASE:-false}" != "true" ]]; then
     install -m 755 "$SRC/build/macos-rdp-daemon" "$BINARY_DEST"
 fi
 
-# ── TLS certificate ───────────────────────────────────────────────────────
+# ── TLS certificate (generated inline — no sub-fetch to 404 on) ───────────
 if [[ ! -f /etc/macos-rdp/server.crt ]]; then
     log "Generating TLS certificate..."
-    bash <(curl -fsSL "$RAW/scripts/gen-tls-cert.sh")
+    mkdir -p /etc/macos-rdp && chmod 700 /etc/macos-rdp
+    HOST="$(hostname)"
+    # -addext needs OpenSSL 1.1.1+/recent LibreSSL; fall back without SAN.
+    if ! openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+            -keyout /etc/macos-rdp/server.key -out /etc/macos-rdp/server.crt \
+            -subj "/CN=$HOST/O=macOS RDP/C=US" \
+            -addext "subjectAltName=DNS:$HOST,IP:127.0.0.1" 2>/dev/null; then
+        openssl req -x509 -newkey rsa:4096 -sha256 -days 3650 -nodes \
+            -keyout /etc/macos-rdp/server.key -out /etc/macos-rdp/server.crt \
+            -subj "/CN=$HOST/O=macOS RDP/C=US"
+    fi
+    chmod 600 /etc/macos-rdp/server.key
+    chmod 644 /etc/macos-rdp/server.crt
 else
     warn "TLS cert exists at /etc/macos-rdp/server.crt — skipping"
 fi
 
-# ── launchd ───────────────────────────────────────────────────────────────
+# ── launchd (plist written inline — no sub-fetch to 404 on) ───────────────
 log "Installing launchd service..."
-curl -fsSL "$RAW/launchd/com.macosrdp.daemon.plist" -o "$PLIST_DEST"
+cat > "$PLIST_DEST" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.macosrdp.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/sbin/macos-rdp-daemon</string>
+        <string>--port</string><string>3389</string>
+    </array>
+    <key>UserName</key><string>root</string>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>EnvironmentVariables</key>
+    <dict><key>RDP_LOG_LEVEL</key><string>info</string></dict>
+    <key>StandardOutPath</key><string>/var/log/macos-rdp-daemon.log</string>
+    <key>StandardErrorPath</key><string>/var/log/macos-rdp-daemon.error.log</string>
+    <key>ThrottleInterval</key><integer>5</integer>
+    <key>ProcessType</key><string>Interactive</string>
+</dict>
+</plist>
+PLIST
 chmod 644 "$PLIST_DEST"
 chown root:wheel "$PLIST_DEST"
 
@@ -106,6 +141,18 @@ elif ! launchctl load -w "$PLIST_DEST" 2>/dev/null; then
     warn "load it manually: sudo launchctl bootstrap system $PLIST_DEST"
 fi
 
+# ── Privacy permissions — open the panes now to make granting one-click ───
+REAL_USER="$(stat -f%Su /dev/console 2>/dev/null || echo "${SUDO_USER:-}")"
+if [[ -n "$REAL_USER" && "$REAL_USER" != "root" ]]; then
+    log "Opening the Privacy panes…"
+    UID_N="$(id -u "$REAL_USER")"
+    launchctl asuser "$UID_N" sudo -u "$REAL_USER" \
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture" 2>/dev/null || true
+    sleep 1
+    launchctl asuser "$UID_N" sudo -u "$REAL_USER" \
+        open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility" 2>/dev/null || true
+fi
+
 # ── Done ──────────────────────────────────────────────────────────────────
 IP=$(ipconfig getifaddr en0 2>/dev/null || ipconfig getifaddr en1 2>/dev/null || echo '<your-ip>')
 
@@ -117,8 +164,11 @@ echo ""
 echo "  Connect to: $IP"
 echo ""
 echo -e "${YELLOW}  ACTION REQUIRED — grant two Privacy permissions:${NC}"
-echo "    System Settings → Privacy & Security → Screen Recording → add macos-rdp-daemon"
-echo "    System Settings → Privacy & Security → Accessibility   → add macos-rdp-daemon"
+echo "    In the panes that just opened, click + → Cmd-Shift-G → /usr/local/sbin"
+echo "    → select macos-rdp-daemon, for BOTH Screen Recording and Accessibility."
+echo ""
+echo "  Helper (re-opens panes; auto-grants if SIP is disabled):"
+echo "    curl -fsSL https://raw.githubusercontent.com/$REPO/master/scripts/grant-permissions.sh | sudo bash"
 echo ""
 echo "  Then:  sudo launchctl kickstart -k system/com.macosrdp.daemon"
 echo ""

@@ -1,13 +1,13 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
-#include <stddef.h>
-
 #include <freerdp/server/rdpsnd.h>
 
-/* Encode and queue PCM audio for the RDP RDPSND channel. */
+/*
+ * Send interleaved signed-16 stereo PCM at 48 kHz to the client.
+ * Returns false if the audio channel is not yet ready (format not negotiated).
+ * Caller must check rdp_peer_send_audio() which guards on audioReady.
+ */
 bool audio_redirect_send(RdpsndServerContext *ctx,
                           const int16_t *samples,
-                          uint32_t frame_count,
-                          uint32_t sample_rate,
-                          uint16_t channels);
+                          size_t frame_count);

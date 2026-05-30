@@ -1,5 +1,6 @@
 #import "display/VirtualDisplay.h"
-#import <CoreGraphics/CGVirtualDisplay.h>
+/* CGVirtualDisplay is part of the CoreGraphics umbrella — no sub-header. */
+#import <CoreGraphics/CoreGraphics.h>
 #define RDP_LOG_COMPONENT "display"
 #include "logging/RDPLog.h"
 

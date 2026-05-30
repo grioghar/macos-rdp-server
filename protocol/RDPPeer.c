@@ -1,46 +1,68 @@
 #define RDP_LOG_COMPONENT "peer"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
 #include <freerdp/server/rdpgfx.h>
 #include <freerdp/server/cliprdr.h>
 #include <freerdp/server/rdpsnd.h>
-#include <freerdp/codec/h264.h>
+#include <freerdp/server/server-common.h>
+#include <freerdp/channels/rdpgfx.h>
+#include <freerdp/channels/wtsvc.h>
 #include <winpr/ssl.h>
+#include <winpr/synch.h>
 #include <string.h>
 #include <stdlib.h>
 
+/* ── Settings ──────────────────────────────────────────────────────────── */
+
 static void peer_apply_settings(freerdp_peer *peer) {
     rdpSettings *s = peer->context->settings;
-    freerdp_settings_set_bool(s, FreeRDP_NetworkAutoDetect,       FALSE);
-    freerdp_settings_set_bool(s, FreeRDP_SupportGraphicsPipeline, TRUE);
-    freerdp_settings_set_bool(s, FreeRDP_GfxH264,                 TRUE);
-    freerdp_settings_set_bool(s, FreeRDP_GfxAVC444,               FALSE);
-    freerdp_settings_set_bool(s, FreeRDP_GfxSmallCache,           FALSE);
-    freerdp_settings_set_bool(s, FreeRDP_RemoteConsoleAudio,      TRUE);
-    freerdp_settings_set_bool(s, FreeRDP_SoundSystem,             TRUE);
-    freerdp_settings_set_bool(s, FreeRDP_AudioCapture,            FALSE);
-    freerdp_settings_set_bool(s, FreeRDP_UseRdpSecurityLayer,     FALSE);
-    freerdp_settings_set_bool(s, FreeRDP_TLSSecLevel,             1);
-    freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,            32);
+    /* Only set what we actually use. Every extra setting is dead weight. */
+    freerdp_settings_set_bool(s,   FreeRDP_NetworkAutoDetect,       FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_SupportGraphicsPipeline, TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_GfxH264,                 TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_GfxAVC444,               FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_GfxSmallCache,           FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_GfxThinClient,           FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_RemoteFxCodec,           FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
+    freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             TRUE);
+    freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,             1);
+    freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,              32);
+    freerdp_settings_set_bool(s,   FreeRDP_UnicodeInput,            TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
     rdp_debug("peer settings applied");
 }
 
+/* ── Context lifecycle ─────────────────────────────────────────────────── */
+
 static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
-    (void)peer; (void)ctx;
-    rdp_debug("peer context allocated");
+    RDPPeerContext *c = (RDPPeerContext *)ctx;
+    /* Open the Virtual Channel Manager — all dynamic channels live under it. */
+    c->vcm = WTSOpenServerA((LPSTR)peer->context);
+    if (!c->vcm || c->vcm == INVALID_HANDLE_VALUE) {
+        rdp_error("WTSOpenServerA failed");
+        return FALSE;
+    }
+    rdp_debug("VCM opened");
     return TRUE;
 }
 
 static void context_free(freerdp_peer *peer, rdpContext *ctx) {
+    (void)peer;
     RDPPeerContext *c = (RDPPeerContext *)ctx;
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
+    if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
     rdp_debug("peer context freed");
-    (void)peer;
 }
+
+/* ── Input callbacks ───────────────────────────────────────────────────── */
 
 static BOOL peer_keyboard(rdpInput *input, UINT16 flags, UINT8 code) {
     RDPPeerContext *ctx = (RDPPeerContext *)input->context;
@@ -63,66 +85,67 @@ static BOOL peer_mouse_ex(rdpInput *input, UINT16 flags, UINT16 x, UINT16 y) {
     return TRUE;
 }
 
+/* ── GFX caps negotiation ──────────────────────────────────────────────── */
+
 static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
                                 const RDPGFX_CAPS_ADVERTISE_PDU *pdu) {
     RDPPeerContext *ctx = (RDPPeerContext *)gfx->custom;
+    rdp_verbose("GFX caps advertise: %u sets", pdu->capsSetCount);
+
+    /* Stack-allocate the capset — capsSet is a pointer in 3.x. */
+    RDPGFX_CAPSET capset = {0};
     RDPGFX_CAPS_CONFIRM_PDU confirm = {0};
+    confirm.capsSet = &capset;
 
-    rdp_verbose("GFX caps advertise: %u cap sets", pdu->capsSetCount);
-
+    /* Walk advertised caps: prefer 8.x (has AVC420), skip anything lower. */
     for (UINT16 i = 0; i < pdu->capsSetCount; i++) {
-        rdp_debug("  caps[%u]: version=0x%08x flags=0x%08x",
+        rdp_debug("  caps[%u] version=0x%08x flags=0x%08x",
                   i, pdu->capsSets[i].version, pdu->capsSets[i].flags);
-        if (pdu->capsSets[i].version == RDPGFX_CAPVERSION_8) {
-            confirm.capsSet.version = RDPGFX_CAPVERSION_8;
-            confirm.capsSet.flags   = pdu->capsSets[i].flags;
+        if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_8) {
+            capset.version = pdu->capsSets[i].version;
+            capset.flags   = pdu->capsSets[i].flags;
             break;
         }
     }
-    if (!confirm.capsSet.version) {
-        confirm.capsSet.version = RDPGFX_CAPVERSION_7;
-        rdp_verbose("GFX: falling back to capsV7");
-    } else {
-        rdp_verbose("GFX: confirmed capsV8 flags=0x%08x", confirm.capsSet.flags);
+    if (!capset.version) {
+        rdp_error("client advertised no usable GFX caps version");
+        return ERROR_INTERNAL_ERROR;
     }
+    rdp_verbose("GFX confirming version=0x%08x flags=0x%08x",
+                capset.version, capset.flags);
 
     UINT rc = gfx->CapsConfirm(gfx, &confirm);
-    if (rc != CHANNEL_RC_OK) {
-        rdp_error("GFX CapsConfirm failed: %u", rc);
-        return rc;
-    }
+    if (rc != CHANNEL_RC_OK) { rdp_error("CapsConfirm failed: %u", rc); return rc; }
 
     rdpSettings *s = ctx->base.peer->context->settings;
-    uint32_t w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
-    uint32_t h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
-    rdp_verbose("GFX: creating surface %ux%u id=%u", w, h, ctx->surfaceId);
+    UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
+    UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
 
-    RDPGFX_CREATE_SURFACE_PDU createSurface = {0};
-    createSurface.surfaceId   = ctx->surfaceId;
-    createSurface.width       = (UINT16)w;
-    createSurface.height      = (UINT16)h;
-    createSurface.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
-    gfx->CreateSurface(gfx, &createSurface);
+    RDPGFX_CREATE_SURFACE_PDU cs = {0};
+    cs.surfaceId   = ctx->surfaceId;
+    cs.width       = (UINT16)w;
+    cs.height      = (UINT16)h;
+    cs.pixelFormat = GFX_PIXEL_FORMAT_XRGB_8888;
+    gfx->CreateSurface(gfx, &cs);
 
-    RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU mapSurface = {0};
-    mapSurface.surfaceId     = ctx->surfaceId;
-    mapSurface.outputOriginX = 0;
-    mapSurface.outputOriginY = 0;
-    gfx->MapSurfaceToOutput(gfx, &mapSurface);
+    RDPGFX_MAP_SURFACE_TO_OUTPUT_PDU ms = {0};
+    ms.surfaceId     = ctx->surfaceId;
+    ms.outputOriginX = 0;
+    ms.outputOriginY = 0;
+    gfx->MapSurfaceToOutput(gfx, &ms);
 
     ctx->gfxReady = true;
-    rdp_info("GFX pipeline ready (%ux%u)", w, h);
+    rdp_info("GFX pipeline ready (%ux%u AVC420)", w, h);
     return CHANNEL_RC_OK;
 }
+
+/* ── Clipboard callbacks ───────────────────────────────────────────────── */
 
 static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_LIST *list) {
     rdp_verbose("clipboard: client advertised %u formats", list->numFormats);
-    for (UINT32 i = 0; i < list->numFormats; i++)
-        rdp_debug("  format[%u]: id=%u name=%s", i,
-                  list->formats[i].formatId,
-                  list->formats[i].formatName ?: "(unnamed)");
-    CLIPRDR_FORMAT_LIST_RESPONSE resp = { .msgFlags = CB_RESPONSE_OK };
+    CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};
+    resp.common.msgFlags = CB_RESPONSE_OK;
     cliprdr->ServerFormatListResponse(cliprdr, &resp);
     return CHANNEL_RC_OK;
 }
@@ -130,55 +153,82 @@ static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
 static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_DATA_RESPONSE *resp) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    if (resp->msgFlags & CB_RESPONSE_OK && ctx->callbacks.onClipboard) {
-        rdp_verbose("clipboard: received %u bytes from client", resp->dataLen);
+    if ((resp->common.msgFlags & CB_RESPONSE_OK) && ctx->callbacks.onClipboard) {
+        rdp_verbose("clipboard: %u bytes from client", resp->common.dataLen);
         ctx->callbacks.onClipboard(ctx->callbacks.userdata,
                                    resp->requestedFormatData,
-                                   resp->dataLen, CF_UNICODETEXT);
+                                   resp->common.dataLen,
+                                   CF_UNICODETEXT);
     }
     return CHANNEL_RC_OK;
 }
+
+/* ── Audio activated callback ──────────────────────────────────────────── */
+
+static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
+    RDPPeerContext *ctx = (RDPPeerContext *)rdpsnd->data;
+    /* Pick the first mutually-supported PCM format. */
+    for (size_t i = 0; i < rdpsnd->num_client_formats; i++) {
+        for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
+            if (audio_format_compatible(&rdpsnd->server_formats[j],
+                                        &rdpsnd->client_formats[i])) {
+                rdpsnd->SelectFormat(rdpsnd, (UINT16)i);
+                ctx->audioReady = true;
+                rdp_verbose("audio format negotiated (client idx %zu)", i);
+                return;
+            }
+        }
+    }
+    rdp_verbose("no compatible audio format found");
+}
+
+/* ── PostConnect: open virtual channels ───────────────────────────────── */
 
 static BOOL peer_post_connect(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     rdp_verbose("post-connect: opening virtual channels");
 
-    ctx->gfx = rdpgfx_server_context_new(peer->context->vcm);
+    /* GFX — dynamic virtual channel, runs in its own internal thread. */
+    ctx->gfx = rdpgfx_server_context_new(ctx->vcm);
     if (!ctx->gfx) { rdp_error("rdpgfx_server_context_new failed"); return FALSE; }
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
     ctx->surfaceId          = 1;
-    if (ctx->gfx->Open(ctx->gfx) != CHANNEL_RC_OK) {
+    if (!ctx->gfx->Open(ctx->gfx)) {
         rdp_verbose("GFX channel open failed — client may not support it");
         rdpgfx_server_context_free(ctx->gfx);
         ctx->gfx = NULL;
-    } else {
-        rdp_verbose("GFX channel opened");
-    }
+    } else { rdp_verbose("GFX channel opened"); }
 
-    ctx->cliprdr = cliprdr_server_context_new(peer->context->vcm);
+    /* Clipboard. */
+    ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
     if (ctx->cliprdr) {
         ctx->cliprdr->custom                   = ctx;
+        ctx->cliprdr->rdpcontext               = peer->context;
         ctx->cliprdr->ClientFormatList         = cliprdr_client_format_list;
         ctx->cliprdr->ClientFormatDataResponse = cliprdr_client_format_data;
+        ctx->cliprdr->useLongFormatNames       = TRUE;
         if (ctx->cliprdr->Open(ctx->cliprdr) != CHANNEL_RC_OK) {
             rdp_verbose("clipboard channel open failed");
             cliprdr_server_context_free(ctx->cliprdr);
             ctx->cliprdr = NULL;
-        } else {
-            rdp_verbose("clipboard channel opened");
-        }
+        } else { rdp_verbose("clipboard channel opened"); }
     }
 
-    ctx->rdpsnd = rdpsnd_server_context_new(peer->context->vcm);
+    /* Audio — uses server_rdpsnd_get_formats to enumerate supported formats. */
+    ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
+        ctx->rdpsnd->data      = ctx;
+        ctx->rdpsnd->Activated = rdpsnd_activated;
+        ctx->rdpsnd->num_server_formats =
+            server_rdpsnd_get_formats(&ctx->rdpsnd->server_formats);
+        if (ctx->rdpsnd->num_server_formats > 0)
+            ctx->rdpsnd->src_format = &ctx->rdpsnd->server_formats[0];
         if (ctx->rdpsnd->Initialize(ctx->rdpsnd, TRUE) != CHANNEL_RC_OK) {
             rdp_verbose("audio channel init failed");
             rdpsnd_server_context_free(ctx->rdpsnd);
             ctx->rdpsnd = NULL;
-        } else {
-            rdp_verbose("audio channel opened");
-        }
+        } else { rdp_verbose("audio channel opened"); }
     }
 
     return TRUE;
@@ -186,18 +236,18 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
 
 static BOOL peer_activate(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    rdpSettings    *s   = peer->context->settings;
     ctx->activated = true;
-
-    uint32_t w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
-    uint32_t h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
-    uint32_t d = freerdp_settings_get_uint32(s, FreeRDP_ColorDepth);
+    rdpSettings *s = peer->context->settings;
+    UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
+    UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
+    UINT32 d = freerdp_settings_get_uint32(s, FreeRDP_ColorDepth);
     rdp_info("peer activated: %ux%u @%ubpp", w, h, d);
-
     if (ctx->callbacks.onReady)
         ctx->callbacks.onReady(ctx->callbacks.userdata, w, h, d);
     return TRUE;
 }
+
+/* ── Public API ────────────────────────────────────────────────────────── */
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT);
@@ -206,7 +256,8 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     freerdp_peer *peer = freerdp_peer_new(fd);
     if (!peer) { rdp_error("freerdp_peer_new failed"); return NULL; }
 
-    peer->context_size = sizeof(RDPPeerContext);
+    /* ContextSize (PascalCase in 3.x) replaces context_size. */
+    peer->ContextSize  = sizeof(RDPPeerContext);
     peer->ContextNew   = context_new;
     peer->ContextFree  = context_free;
 
@@ -222,18 +273,20 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer_apply_settings(peer);
     peer->PostConnect = peer_post_connect;
     peer->Activate    = peer_activate;
-    peer->input->KeyboardEvent      = peer_keyboard;
-    peer->input->MouseEvent         = peer_mouse;
-    peer->input->ExtendedMouseEvent = peer_mouse_ex;
+
+    /* Input is on rdpContext, not on freerdp_peer in 3.x. */
+    peer->context->input->KeyboardEvent      = peer_keyboard;
+    peer->context->input->MouseEvent         = peer_mouse;
+    peer->context->input->ExtendedMouseEvent = peer_mouse_ex;
 
     if (!peer->Initialize(peer)) {
-        rdp_error("peer Initialize failed (TLS/NLA handshake error)");
+        rdp_error("peer Initialize failed (TLS handshake error)");
         freerdp_peer_context_free(peer);
         freerdp_peer_free(peer);
         return NULL;
     }
 
-    rdp_verbose("peer initialized successfully");
+    rdp_verbose("peer initialized");
     return peer;
 }
 
@@ -244,14 +297,59 @@ void rdp_peer_destroy(freerdp_peer *peer) {
     freerdp_peer_free(peer);
 }
 
+/*
+ * Event-driven run: waits on peer transport handles + VCM channel event
+ * rather than spinning. Blocks up to 50ms then returns — caller checks
+ * disconnect flag. This replaces the busy-poll loop with proper WaitForMultiple.
+ */
 bool rdp_peer_run_once(freerdp_peer *peer) {
-    if (!peer->CheckFileDescriptor(peer)) {
-        rdp_verbose("CheckFileDescriptor returned false — connection closed");
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+
+    HANDLE events[68] = {0};
+    DWORD  nCount = 0;
+
+    /* Peer transport events (typically 1-2 handles). */
+    DWORD n = peer->GetEventHandles(peer, events, 64);
+    if (n == 0) { rdp_error("GetEventHandles returned 0"); return false; }
+    nCount += n;
+
+    /* VCM channel event (drdynvc, cliprdr, etc.). */
+    HANDLE vcmEvent = WTSVirtualChannelManagerGetEventHandle(ctx->vcm);
+    if (vcmEvent) events[nCount++] = vcmEvent;
+
+    /* GFX channel event (when GFX is open and uses external event). */
+    if (ctx->gfx) {
+        HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
+        if (gfxEvent) events[nCount++] = gfxEvent;
+    }
+
+    DWORD status = WaitForMultipleObjects(nCount, events, FALSE, 50 /*ms*/);
+    if (status == WAIT_FAILED) {
+        rdp_error("WaitForMultipleObjects failed");
         return false;
     }
-    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (ctx->gfx)    ctx->gfx->CheckFileDescriptor(ctx->gfx);
-    if (ctx->cliprdr) ctx->cliprdr->CheckFileDescriptor(ctx->cliprdr);
+
+    /* Process peer transport data. */
+    if (!peer->CheckFileDescriptor(peer)) {
+        rdp_verbose("peer transport closed");
+        return false;
+    }
+
+    /* Dispatch any pending virtual channel messages. */
+    if (vcmEvent && WaitForSingleObject(vcmEvent, 0) == WAIT_OBJECT_0) {
+        if (!WTSVirtualChannelManagerCheckFileDescriptor(ctx->vcm)) {
+            rdp_error("VCM check failed");
+            return false;
+        }
+    }
+
+    /* Drain GFX channel messages. */
+    if (ctx->gfx) {
+        HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
+        if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0)
+            rdpgfx_server_handle_messages(ctx->gfx);
+    }
+
     return true;
 }
 
@@ -259,15 +357,12 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
                                const uint8_t *data, size_t len,
                                uint32_t width, uint32_t height) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->gfxReady || !ctx->gfx) {
-        rdp_debug("h264 send skipped: GFX not ready");
-        return false;
-    }
+    if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
 
     RECTANGLE_16 rect = {0, 0, (UINT16)width, (UINT16)height};
     RDPGFX_AVC420_BITMAP_STREAM avc = {0};
-    avc.data   = (BYTE *)data;
-    avc.length = (UINT32)len;
+    avc.data                  = (BYTE *)data;
+    avc.length                = (UINT32)len;
     avc.meta.numRegionRects   = 1;
     avc.meta.regionRects      = &rect;
     avc.meta.quantQualityVals = NULL;
@@ -276,7 +371,6 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.surfaceId = ctx->surfaceId;
     cmd.codecId   = RDPGFX_CODECID_AVC420;
     cmd.format    = GFX_PIXEL_FORMAT_XRGB_8888;
-    cmd.left      = 0; cmd.top = 0;
     cmd.right     = (UINT16)width;
     cmd.bottom    = (UINT16)height;
     cmd.length    = (UINT32)len;
@@ -284,25 +378,22 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.extra     = &avc;
 
     UINT rc = ctx->gfx->SurfaceCommand(ctx->gfx, &cmd);
-    if (rc != CHANNEL_RC_OK) {
-        rdp_error("SurfaceCommand failed: %u", rc);
-        return false;
-    }
+    if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceCommand failed: %u", rc); return false; }
     return true;
 }
 
 bool rdp_peer_send_bitmap(freerdp_peer *peer,
                            const uint8_t *bgra, uint32_t x, uint32_t y,
                            uint32_t width, uint32_t height) {
-    rdp_verbose("sending bitmap update %ux%u at (%u,%u)", width, height, x, y);
     rdpUpdate *update = peer->context->update;
     SURFACE_BITS_COMMAND cmd = {0};
-    cmd.destLeft   = (UINT16)x;    cmd.destTop    = (UINT16)y;
-    cmd.destRight  = (UINT16)(x + width);
-    cmd.destBottom = (UINT16)(y + height);
-    cmd.bmp.bpp    = 32;
-    cmd.bmp.width  = (UINT16)width;
-    cmd.bmp.height = (UINT16)height;
+    cmd.destLeft             = (UINT16)x;
+    cmd.destTop              = (UINT16)y;
+    cmd.destRight            = (UINT16)(x + width);
+    cmd.destBottom           = (UINT16)(y + height);
+    cmd.bmp.bpp              = 32;
+    cmd.bmp.width            = (UINT16)width;
+    cmd.bmp.height           = (UINT16)height;
     cmd.bmp.bitmapData       = (BYTE *)bgra;
     cmd.bmp.bitmapDataLength = width * height * 4;
     cmd.bmp.codecID          = RDP_CODEC_ID_NONE;
@@ -312,26 +403,29 @@ bool rdp_peer_send_bitmap(freerdp_peer *peer,
 bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->rdpsnd) { rdp_debug("audio send skipped: no rdpsnd channel"); return false; }
-    return audio_redirect_send(ctx->rdpsnd, samples, frame_count, 48000, 2);
+    if (!ctx->rdpsnd || !ctx->audioReady) return false;
+    /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature. */
+    return ctx->rdpsnd->SendSamples(ctx->rdpsnd, samples, frame_count, 0)
+           == CHANNEL_RC_OK;
 }
 
 bool rdp_peer_send_clipboard(freerdp_peer *peer,
                               const uint8_t *data, size_t len,
                               uint32_t format) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
-    if (!ctx->cliprdr) { rdp_verbose("clipboard send skipped: no channel"); return false; }
-    rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", format, len);
+    if (!ctx->cliprdr) { rdp_verbose("no clipboard channel"); return false; }
 
-    CLIPRDR_FORMAT formats[] = {{.formatId = (UINT32)format, .formatName = NULL}};
-    CLIPRDR_FORMAT_LIST list  = { .msgFlags = CB_RESPONSE_OK, .numFormats = 1, .formats = formats };
+    CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = NULL };
+    CLIPRDR_FORMAT_LIST list = {0};
+    list.common.msgFlags = CB_RESPONSE_OK;
+    list.numFormats      = 1;
+    list.formats         = &fmt;
     ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
 
-    CLIPRDR_FORMAT_DATA_RESPONSE resp = {
-        .msgFlags            = CB_RESPONSE_OK,
-        .dataLen             = (UINT32)len,
-        .requestedFormatData = (BYTE *)data,
-    };
+    CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
+    resp.common.msgFlags      = CB_RESPONSE_OK;
+    resp.common.dataLen       = (UINT32)len;
+    resp.requestedFormatData  = (BYTE *)data;
     ctx->cliprdr->ServerFormatDataResponse(ctx->cliprdr, &resp);
     return true;
 }

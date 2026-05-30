@@ -169,9 +169,7 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     _audio = [[AudioCapture alloc] init];
     _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
         rdp_debug("audio: %u frames", frameCount);
-        RDPPeerContext *ctx = (RDPPeerContext *)weak.peer->context;
-        if (ctx && ctx->rdpsnd)
-            audio_redirect_send(ctx->rdpsnd, samples, frameCount, 48000, 2);
+        rdp_peer_send_audio(weak.peer, samples, frameCount);
     };
     NSError *audioErr = nil;
     if (![_audio startWithError:&audioErr]) {

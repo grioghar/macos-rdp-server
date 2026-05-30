@@ -26,13 +26,19 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
 ```
 
-Downloads the latest pre-built universal binary (Intel + Apple Silicon) from GitHub Releases — no Homebrew or compilation required. Falls back to building from source if no binary is available.
+Downloads the latest pre-built **universal binary** (single file, runs natively on Intel and Apple Silicon) from GitHub Releases. No Homebrew, no compilation, no dependencies.
 
 The script will:
-1. Download the pre-built binary to `/usr/local/sbin/macos-rdp-daemon`
+1. Download the universal binary to `/usr/local/sbin/macos-rdp-daemon`
 2. Generate a self-signed TLS certificate at `/etc/macos-rdp/`
 3. Install and load the launchd service on port 3389
 4. Print your IP address and the two Privacy permission steps required
+
+Or download the binary directly:
+```bash
+sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/latest/download/macos-rdp-daemon \
+  -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
+```
 
 After installation, open any RDP client and connect to your Mac's IP address.
 

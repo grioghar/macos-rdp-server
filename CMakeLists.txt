@@ -105,7 +105,7 @@ target_compile_options(macos-rdp-daemon PRIVATE
 set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 target_compile_definitions(macos-rdp-daemon PRIVATE
-    MACOS_RDP_VERSION="0.1.2"
+    MACOS_RDP_VERSION="0.1.0"
 )
 
 # ── Install ───────────────────────────────────────────────────────────────

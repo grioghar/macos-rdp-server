@@ -7,52 +7,40 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag (e.g. v0.1.1)'
+        description: 'Release tag (e.g. v0.1.0)'
         required: true
 
 jobs:
-  # ────────────────────────────────────────────────────────────────────────
-  build:
-    name: Build (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: macos-13
-          - arch: arm64
-            runner: macos-14
+  build-and-release:
+    name: Build universal binary and release
+    runs-on: macos-14
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Toolchain ────────────────────────────────────────────────────────
       - name: Install build tools
         run: |
           brew install cmake ninja pkg-config openssl@3
           echo "OPENSSL_ROOT=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
 
-      # ── FreeRDP static build (cached) ────────────────────────────────────
       - name: Read FreeRDP version
         id: freerdp-ver
-        run: echo "ver=$(cat .github/freerdp-version | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+        run: echo "ver=$(tr -d '[:space:]' < .github/freerdp-version)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache FreeRDP static build
+      - name: Cache FreeRDP universal static build
         id: cache-freerdp
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v3
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-universal-static-v1
 
-      - name: Build FreeRDP from source (static)
+      - name: Build FreeRDP (universal static)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
         env:
           FREERDP_VER: ${{ steps.freerdp-ver.outputs.ver }}
         run: |
           set -euo pipefail
-          JOBS=$(sysctl -n hw.logicalcpu)
           SRC="$RUNNER_TEMP/freerdp-src"
           INSTALL="$HOME/freerdp-install"
 
@@ -64,7 +52,8 @@ jobs:
               -DCMAKE_C_FLAGS="-Os" \
               -DCMAKE_CXX_FLAGS="-Os" \
               -DCMAKE_INSTALL_PREFIX="$INSTALL" \
-              -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
               -DCMAKE_PREFIX_PATH="$OPENSSL_ROOT" \
               -DBUILD_SHARED_LIBS=OFF \
               -DWITH_SERVER=ON \
@@ -79,6 +68,7 @@ jobs:
               -DWITH_DSP_FFMPEG=OFF \
               -DWITH_CAIRO=OFF \
               -DWITH_OPUS=OFF \
+              -DWITH_RDTK=OFF \
               -DWITH_WAYLAND=OFF \
               -DWITH_X11=OFF \
               -DWITH_CUPS=OFF \
@@ -100,111 +90,57 @@ jobs:
               -DWITH_PARALLEL=OFF \
               -DWITH_URBDRC=OFF \
               -DWITH_VIDEO_ENCODER=OFF \
-              -DWITH_RDTK=OFF \
-              -DWITH_SSE2=ON \
               -DWITH_NEON=OFF \
               -DBUILD_TESTING=OFF \
               -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" \
               -DOPENSSL_USE_STATIC_LIBS=TRUE
 
-          cmake --build "$SRC/build" --parallel "$JOBS"
+          cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
           cmake --install "$SRC/build"
 
-      # ── Build daemon ─────────────────────────────────────────────────────
-      - name: Build macos-rdp-daemon (static linked)
+      - name: Build macos-rdp-daemon (universal)
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja \
               -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
+              -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+              -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
               -DMACOS_RDP_STATIC=ON \
               -DFREERDP_STATIC_INSTALL="$HOME/freerdp-install" \
               -DCMAKE_PREFIX_PATH="$HOME/freerdp-install;$OPENSSL_ROOT" \
               -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" \
               -DOPENSSL_USE_STATIC_LIBS=TRUE
-
           cmake --build build --parallel "$(sysctl -n hw.logicalcpu)"
 
-      # ── Verify & strip ───────────────────────────────────────────────────
-      - name: Verify binary is self-contained
+      - name: Verify universal binary
         run: |
           BIN=build/macos-rdp-daemon
-          echo "=== otool -L ==="
+          echo "=== architectures ==="
+          lipo -info "$BIN"
+          echo "=== external dylib deps ==="
           otool -L "$BIN"
-          echo "=== architecture ==="
-          file "$BIN"
-          # Fail if any non-system dylib is linked
-          EXTERNAL=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | \
-              grep -v '^/usr/lib/' | grep -v '^/System/' | \
-              grep -v '^@' || true)
+          EXTERNAL=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' \
+            | grep -v '^/usr/lib/' | grep -v '^/System/' | grep -v '^@' || true)
           if [[ -n "$EXTERNAL" ]]; then
-              echo "ERROR: Binary has external dylib dependencies:"
-              echo "$EXTERNAL"
-              exit 1
+            echo "ERROR: non-system dylib dependencies found:"
+            echo "$EXTERNAL"; exit 1
           fi
-          echo "OK — binary only depends on system libraries"
+          echo "OK — universal binary, system deps only"
           strip -x "$BIN"
+          ls -lh "$BIN"
 
-      - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: macos-rdp-daemon-${{ matrix.arch }}
-          path: build/macos-rdp-daemon
-          retention-days: 1
-          if-no-files-found: error
-
-  # ────────────────────────────────────────────────────────────────────────
-  release:
-    name: Create Release
-    needs: build
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download arm64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-rdp-daemon-arm64
-          path: dist/arm64
-
-      - name: Download x86_64 binary
-        uses: actions/download-artifact@v4
-        with:
-          name: macos-rdp-daemon-x86_64
-          path: dist/x86_64
-
-      - name: Create universal binary with lipo
+      - name: Compute SHA-256
         run: |
-          chmod +x dist/arm64/macos-rdp-daemon dist/x86_64/macos-rdp-daemon
-          lipo -create -output dist/macos-rdp-daemon-universal \
-              dist/arm64/macos-rdp-daemon \
-              dist/x86_64/macos-rdp-daemon
-          lipo -info dist/macos-rdp-daemon-universal
+          shasum -a 256 build/macos-rdp-daemon > build/SHA256SUMS
+          cat build/SHA256SUMS
 
-          # Rename arch-specific binaries
-          cp dist/arm64/macos-rdp-daemon   dist/macos-rdp-daemon-arm64
-          cp dist/x86_64/macos-rdp-daemon  dist/macos-rdp-daemon-x86_64
-
-          echo "=== sizes ==="
-          ls -lh dist/macos-rdp-daemon-*
-
-      - name: Compute SHA-256 checksums
-        run: |
-          cd dist
-          shasum -a 256 macos-rdp-daemon-arm64 \
-                        macos-rdp-daemon-x86_64 \
-                        macos-rdp-daemon-universal > SHA256SUMS
-          cat SHA256SUMS
-
-      - name: Determine release tag
+      - name: Determine tag
         id: tag
         run: |
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
-              echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           else
-              echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create GitHub release
@@ -212,55 +148,49 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.name }}
         run: |
-          FREERDP_VER=$(cat .github/freerdp-version | tr -d '[:space:]')
+          FREERDP_VER=$(tr -d '[:space:]' < .github/freerdp-version)
 
           gh release create "$TAG" \
-              --title "macos-rdp-server $TAG" \
-              --notes "$(cat <<EOF
-          ## macos-rdp-server $TAG
+            --title "macos-rdp-server $TAG" \
+            --notes "$(cat <<EOF
+## macos-rdp-server $TAG
 
-          Lightweight RDP server daemon for macOS. Pre-built binaries — no Homebrew or compilation required.
+Lightweight RDP server for macOS. Single universal binary — runs natively on both Intel and Apple Silicon. No Homebrew, no compilation.
 
-          ### Install (one line)
+### One-line install
 
-          **Universal (auto-detects Intel or Apple Silicon):**
-          \`\`\`bash
-          sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/macos-rdp-daemon-universal -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
-          \`\`\`
+\`\`\`bash
+curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
+\`\`\`
 
-          Then follow the [setup steps](https://github.com/grioghar/macos-rdp-server#privacy-permissions) to grant Privacy permissions and load the launchd service.
+### Manual download
 
-          ### Downloads
+\`\`\`bash
+sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/macos-rdp-daemon -o /usr/local/sbin/macos-rdp-daemon
+sudo chmod +x /usr/local/sbin/macos-rdp-daemon
+\`\`\`
 
-          | File | Architecture |
-          |------|-------------|
-          | \`macos-rdp-daemon-universal\` | Universal (Intel + Apple Silicon) |
-          | \`macos-rdp-daemon-arm64\`     | Apple Silicon only |
-          | \`macos-rdp-daemon-x86_64\`    | Intel only |
-          | \`SHA256SUMS\`                 | Checksums |
+### Verify checksum
 
-          ### What's included
+\`\`\`bash
+curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/SHA256SUMS | shasum -c
+\`\`\`
 
-          - H.264 hardware encoding via VideoToolbox
-          - Virtual display via CGVirtualDisplay
-          - System audio redirection via CoreAudio HAL
-          - Clipboard sync (text + images)
-          - Full keyboard/mouse injection
-          - TLS encryption (self-signed cert generated on first run)
+### What's included
 
-          ### Built with
+- H.264 hardware encoding via VideoToolbox
+- Screen capture via CGDisplayStream (zero-copy IOSurface path)
+- System audio redirection via CoreAudio HAL
+- Bidirectional clipboard (text + images)
+- Full keyboard/mouse injection
+- TLS encryption (self-signed cert on first run)
+- Zero idle CPU: frame encode skipped on static screens, event-driven signal handling
 
-          - FreeRDP $FREERDP_VER (statically linked)
-          - macOS 13 SDK (Intel) / macOS 14 SDK (Apple Silicon)
+### Built with
 
-          ### Verify checksums
-
-          \`\`\`bash
-          curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/SHA256SUMS | shasum -c
-          \`\`\`
-          EOF
-          )" \
-              dist/macos-rdp-daemon-universal \
-              dist/macos-rdp-daemon-arm64 \
-              dist/macos-rdp-daemon-x86_64 \
-              dist/SHA256SUMS
+- FreeRDP $FREERDP_VER (statically linked — no runtime dependencies)
+- macOS 14 SDK · Universal binary (arm64 + x86_64)
+EOF
+)" \
+            build/macos-rdp-daemon \
+            build/SHA256SUMS

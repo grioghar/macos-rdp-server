@@ -1,0 +1,15 @@
+# Build output
+build/
+cmake-build-*/
+*.o
+*.a
+*.dSYM/
+
+# Exported data and copied databases (never commit personal messages)
+imessage-export/
+export/
+*.db
+*.db-wal
+*.db-shm
+
+.DS_Store

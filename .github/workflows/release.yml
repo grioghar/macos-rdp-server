@@ -143,38 +143,28 @@ jobs:
             echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create GitHub release
+      - name: Write release notes
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ steps.tag.outputs.name }}
         run: |
           FREERDP_VER=$(tr -d '[:space:]' < .github/freerdp-version)
+          cat > /tmp/release-notes.md << NOTES
+## macos-rdp-server ${TAG}
 
-          gh release create "$TAG" \
-            --title "macos-rdp-server $TAG" \
-            --notes "$(cat <<EOF
-## macos-rdp-server $TAG
-
-Lightweight RDP server for macOS. Single universal binary — runs natively on both Intel and Apple Silicon. No Homebrew, no compilation.
+Lightweight RDP server for macOS. Single universal binary — runs natively on Intel and Apple Silicon. No Homebrew, no compilation.
 
 ### One-line install
 
-\`\`\`bash
-curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
-\`\`\`
+    curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/main/scripts/remote-install.sh | sudo bash
 
-### Manual download
+### Manual binary download
 
-\`\`\`bash
-sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/macos-rdp-daemon -o /usr/local/sbin/macos-rdp-daemon
-sudo chmod +x /usr/local/sbin/macos-rdp-daemon
-\`\`\`
+    sudo curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/${TAG}/macos-rdp-daemon \\
+      -o /usr/local/sbin/macos-rdp-daemon && sudo chmod +x /usr/local/sbin/macos-rdp-daemon
 
 ### Verify checksum
 
-\`\`\`bash
-curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/SHA256SUMS | shasum -c
-\`\`\`
+    curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/${TAG}/SHA256SUMS | shasum -c
 
 ### What's included
 
@@ -183,14 +173,22 @@ curl -fsSL https://github.com/grioghar/macos-rdp-server/releases/download/$TAG/S
 - System audio redirection via CoreAudio HAL
 - Bidirectional clipboard (text + images)
 - Full keyboard/mouse injection
-- TLS encryption (self-signed cert on first run)
-- Zero idle CPU: frame encode skipped on static screens, event-driven signal handling
+- TLS encryption (self-signed cert generated on first run)
+- Zero idle CPU: frames skipped on static screens, event-driven signal handling
 
 ### Built with
 
-- FreeRDP $FREERDP_VER (statically linked — no runtime dependencies)
-- macOS 14 SDK · Universal binary (arm64 + x86_64)
-EOF
-)" \
+- FreeRDP ${FREERDP_VER} (statically linked)
+- macOS 14 SDK, universal binary (arm64 + x86_64)
+NOTES
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.tag.outputs.name }}
+        run: |
+          gh release create "$TAG" \
+            --title "macos-rdp-server $TAG" \
+            --notes-file /tmp/release-notes.md \
             build/macos-rdp-daemon \
             build/SHA256SUMS

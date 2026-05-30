@@ -41,7 +41,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v4
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v5-fork
 
       - name: Build FreeRDP (static)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -51,7 +51,9 @@ jobs:
           set -euo pipefail
           SRC="$RUNNER_TEMP/freerdp-src"
           INSTALL="$HOME/freerdp-install"
-          git clone --depth 1 --branch "$FREERDP_VER" https://github.com/FreeRDP/FreeRDP.git "$SRC"
+          # Build from our fork so efficiency patches (PR #12826, #12827) are included.
+          git clone --depth 1 --branch "perf/rdpgfx-preallocate-send-stream" \
+            https://github.com/grioghar/FreeRDP.git "$SRC"
           cmake -S "$SRC" -B "$SRC/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DCMAKE_C_FLAGS="-Os" \

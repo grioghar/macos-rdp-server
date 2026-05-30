@@ -71,6 +71,11 @@ static const uint16_t kExtScanToVK[256] = {
 
 @interface InputInjector ()
 @property (nonatomic, assign) CGDirectDisplayID displayID;
+/* Button state — needed to emit MouseDragged (not MouseMoved) while a button
+ * is held, otherwise drags / text selection / window moves don't work. */
+@property (nonatomic, assign) BOOL leftDown;
+@property (nonatomic, assign) BOOL rightDown;
+@property (nonatomic, assign) BOOL middleDown;
 @end
 
 @implementation InputInjector
@@ -90,8 +95,8 @@ static const uint16_t kExtScanToVK[256] = {
 }
 
 - (void)injectKeyEvent:(uint16_t)flags scanCode:(uint16_t)code {
-    BOOL isRelease = (flags & RDP_KEYRELEASE) != 0;
-    BOOL isExtended = (flags & RDP_KEY_EXTENDED) != 0;
+    BOOL isRelease = (flags & RDP_KBD_RELEASE) != 0;
+    BOOL isExtended = (flags & RDP_KBD_EXTENDED) != 0;
     CGKeyCode vk = [self keyCodeForScanCode:code extended:isExtended];
     if (vk == 0xFFFF) return;
 
@@ -106,20 +111,37 @@ static const uint16_t kExtScanToVK[256] = {
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y {
     CGPoint pos = CGPointMake(x, y);
 
-    /* Map virtual display coordinates to screen coordinates. */
+    /* Map virtual display coordinates to global screen coordinates. */
     CGRect bounds = CGDisplayBounds(_displayID);
     pos.x += bounds.origin.x;
     pos.y += bounds.origin.y;
 
-    CGEventType type = kCGEventMouseMoved;
-    CGMouseButton button = kCGMouseButtonLeft;
+    BOOL down = (flags & RDP_PTR_DOWN) != 0;
+    CGEventType type;
+    CGMouseButton button;
 
-    if      (flags & RDP_MOUSE_LDOWN) { type = kCGEventLeftMouseDown;  button = kCGMouseButtonLeft; }
-    else if (flags & RDP_MOUSE_LUP)   { type = kCGEventLeftMouseUp;    button = kCGMouseButtonLeft; }
-    else if (flags & RDP_MOUSE_RDOWN) { type = kCGEventRightMouseDown; button = kCGMouseButtonRight; }
-    else if (flags & RDP_MOUSE_RUP)   { type = kCGEventRightMouseUp;   button = kCGMouseButtonRight; }
-    else if (flags & RDP_MOUSE_MDOWN) { type = kCGEventOtherMouseDown; button = kCGMouseButtonCenter; }
-    else if (flags & RDP_MOUSE_MUP)   { type = kCGEventOtherMouseUp;   button = kCGMouseButtonCenter; }
+    if (flags & RDP_PTR_BUTTON1) {
+        button = kCGMouseButtonLeft;
+        type = down ? kCGEventLeftMouseDown : kCGEventLeftMouseUp;
+        _leftDown = down;
+    } else if (flags & RDP_PTR_BUTTON2) {
+        button = kCGMouseButtonRight;
+        type = down ? kCGEventRightMouseDown : kCGEventRightMouseUp;
+        _rightDown = down;
+    } else if (flags & RDP_PTR_BUTTON3) {
+        button = kCGMouseButtonCenter;
+        type = down ? kCGEventOtherMouseDown : kCGEventOtherMouseUp;
+        _middleDown = down;
+    } else if (flags & RDP_PTR_MOVE) {
+        /* A move with a button held is a drag — macOS needs the dragged event
+         * type or the gesture (selection, window move) is dropped. */
+        if (_leftDown)        { type = kCGEventLeftMouseDragged;  button = kCGMouseButtonLeft; }
+        else if (_rightDown)  { type = kCGEventRightMouseDragged; button = kCGMouseButtonRight; }
+        else if (_middleDown) { type = kCGEventOtherMouseDragged; button = kCGMouseButtonCenter; }
+        else                  { type = kCGEventMouseMoved;        button = kCGMouseButtonLeft; }
+    } else {
+        return; /* nothing actionable */
+    }
 
     CGEventRef event = CGEventCreateMouseEvent(NULL, type, pos, button);
     if (!event) return;
@@ -127,15 +149,20 @@ static const uint16_t kExtScanToVK[256] = {
     CFRelease(event);
 }
 
-- (void)injectMouseWheelEvent:(uint16_t)flags delta:(int16_t)delta
-                            x:(uint16_t)x y:(uint16_t)y {
+- (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y {
     (void)x; (void)y;
-    BOOL horizontal = (flags & RDP_MOUSE_HWHEEL) != 0;
+    BOOL horizontal = (flags & RDP_PTR_HWHEEL) != 0;
 
-    /* RDP wheel delta is in 1/120th of a notch units, macOS uses lines. */
-    int32_t lines = delta / 120;
-    if (lines == 0) lines = (delta > 0) ? 1 : -1;
+    /* Rotation magnitude is the low 8 bits; PTR_FLAGS_WHEEL_NEGATIVE flips sign.
+     * Windows sends multiples of WHEEL_DELTA (120) per notch. */
+    int32_t rotation = flags & 0xFF;
+    if (flags & RDP_PTR_WHEEL_NEGATIVE) rotation = -rotation;
 
+    int32_t lines = rotation / 120;
+    if (lines == 0) lines = (rotation > 0) ? 1 : (rotation < 0 ? -1 : 0);
+    if (lines == 0) return;
+
+    /* macOS scroll sign is opposite RDP for vertical (natural direction). */
     CGEventRef event = CGEventCreateScrollWheelEvent(
         NULL, kCGScrollEventUnitLine,
         horizontal ? 2 : 1,

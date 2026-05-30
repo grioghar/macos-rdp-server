@@ -4,20 +4,21 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
-/* RDP scan code flags (from RDP spec §2.2.8.1.1.3.1) */
-#define RDP_KEYRELEASE    0x8000
-#define RDP_KEY_EXTENDED  0x0100
+/* RDP keyboard flags (MS-RDPBCGR 2.2.8.1.1.3.1.1.1) */
+#define RDP_KBD_RELEASE   0x8000   /* KBDFLAGS_RELEASE */
+#define RDP_KBD_EXTENDED  0x0100   /* KBDFLAGS_EXTENDED */
 
-/* RDP mouse flags */
-#define RDP_MOUSE_LDOWN   0x1000
-#define RDP_MOUSE_LUP     0x0800
-#define RDP_MOUSE_RDOWN   0x4000
-#define RDP_MOUSE_RUP     0x2000
-#define RDP_MOUSE_MDOWN   0x0020
-#define RDP_MOUSE_MUP     0x0010
-#define RDP_MOUSE_MOVE    0x0800
-#define RDP_MOUSE_WHEEL   0x0200
-#define RDP_MOUSE_HWHEEL  0x0400
+/* RDP pointer flags (MS-RDPBCGR 2.2.8.1.1.3.1.1.3). Button press vs release is
+ * the DOWN bit — NOT separate values; identity is the BUTTONn bit. */
+#define RDP_PTR_MOVE              0x0800
+#define RDP_PTR_DOWN              0x8000
+#define RDP_PTR_BUTTON1           0x1000   /* left   */
+#define RDP_PTR_BUTTON2           0x2000   /* right  */
+#define RDP_PTR_BUTTON3           0x4000   /* middle */
+#define RDP_PTR_WHEEL             0x0200
+#define RDP_PTR_HWHEEL            0x0400
+#define RDP_PTR_WHEEL_NEGATIVE    0x0100
+#define RDP_PTR_WHEEL_ROTATION    0x01FF
 
 @interface InputInjector : NSObject
 
@@ -25,8 +26,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (void)injectKeyEvent:(uint16_t)flags scanCode:(uint16_t)code;
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
-- (void)injectMouseWheelEvent:(uint16_t)flags delta:(int16_t)delta
-                            x:(uint16_t)x y:(uint16_t)y;
+/* Wheel rotation is encoded entirely within flags; decoded internally. */
+- (void)injectMouseWheelEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;
 
 @end
 

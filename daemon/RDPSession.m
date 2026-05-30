@@ -102,8 +102,8 @@ static void rdp_on_keyboard(void *ud, uint16_t flags, uint16_t code) {
 static void rdp_on_mouse(void *ud, uint16_t flags, uint16_t x, uint16_t y) {
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_debug("mouse flags=0x%04x x=%u y=%u", flags, x, y);
-    if (flags & RDP_MOUSE_WHEEL)
-        [self.injector injectMouseWheelEvent:flags delta:(int16_t)(flags >> 8) x:x y:y];
+    if (flags & (RDP_PTR_WHEEL | RDP_PTR_HWHEEL))
+        [self.injector injectMouseWheelEvent:flags x:x y:y];
     else
         [self.injector injectMouseEvent:flags x:x y:y];
 }

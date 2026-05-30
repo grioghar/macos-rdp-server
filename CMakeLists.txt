@@ -18,6 +18,14 @@ option(MACOS_RDP_STATIC
        "Link FreeRDP/WinPR as static libraries (used in CI release builds)"
        OFF)
 
+# Enable NLA/CredSSP authentication. Off by default: it requires an OpenSSL that
+# exposes the legacy provider (NTLM needs MD4/RC4/DES) and provisioned
+# credentials. With this OFF the security path is identical to before (TLS, no
+# auth). See docs/enabling-nla.md.
+option(MACOS_RDP_ENABLE_NLA
+       "Build the NLA/CredSSP authenticated security path"
+       OFF)
+
 if(MACOS_RDP_STATIC)
     # CI passes -DFREERDP_STATIC_INSTALL=<path> pointing at the cmake-installed
     # FreeRDP tree built with BUILD_SHARED_LIBS=OFF.
@@ -34,11 +42,17 @@ if(MACOS_RDP_STATIC)
          "${FREERDP_ROOT}/lib/*.a"
          "${FREERDP_ROOT}/lib64/*.a")
 
-    # OpenSSL static libs must come after FreeRDP on the link line.
+    # OpenSSL static libs must come after FreeRDP on the link line. When NLA is
+    # enabled, the legacy + common provider archives are linked too (NTLM needs
+    # MD4/RC4/DES); they must precede libcrypto.a so their symbols resolve.
     if(OPENSSL_ROOT_DIR)
-        file(GLOB OPENSSL_STATIC_LIBS
-             "${OPENSSL_ROOT_DIR}/lib/libssl.a"
-             "${OPENSSL_ROOT_DIR}/lib/libcrypto.a")
+        set(OPENSSL_STATIC_LIBS "${OPENSSL_ROOT_DIR}/lib/libssl.a")
+        if(MACOS_RDP_ENABLE_NLA)
+            list(APPEND OPENSSL_STATIC_LIBS
+                 "${OPENSSL_ROOT_DIR}/lib/liblegacy.a"
+                 "${OPENSSL_ROOT_DIR}/lib/libcommon.a")
+        endif()
+        list(APPEND OPENSSL_STATIC_LIBS "${OPENSSL_ROOT_DIR}/lib/libcrypto.a")
     endif()
 
     set(FREERDP_LINK_LIBS
@@ -62,6 +76,7 @@ add_executable(macos-rdp-daemon
     daemon/RDPServer.m
     daemon/RDPSession.m
     protocol/RDPPeer.c
+    protocol/RDPSecurity.c
     display/VirtualDisplay.m
     display/ScreenCapture.m
     display/FrameEncoder.m
@@ -108,6 +123,22 @@ set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.6"
 )
+
+# ── NLA / authenticated security path (opt-in) ──────────────────────────────
+if(MACOS_RDP_ENABLE_NLA)
+    target_compile_definitions(macos-rdp-daemon PRIVATE MACOS_RDP_ENABLE_NLA)
+    if(MACOS_RDP_STATIC)
+        # Fully static OpenSSL: register the built-in legacy provider (the
+        # liblegacy.a/libcommon.a archives are added to the link line above).
+        target_compile_definitions(macos-rdp-daemon PRIVATE MACOS_RDP_STATIC_LEGACY)
+        target_include_directories(macos-rdp-daemon PRIVATE "${OPENSSL_ROOT_DIR}/include")
+    else()
+        # Dynamic build (local/CI): use the system OpenSSL's loadable legacy module.
+        find_package(OpenSSL REQUIRED)
+        target_include_directories(macos-rdp-daemon PRIVATE ${OPENSSL_INCLUDE_DIR})
+        target_link_libraries(macos-rdp-daemon PRIVATE OpenSSL::Crypto)
+    endif()
+endif()
 
 # ── Install ───────────────────────────────────────────────────────────────
 install(TARGETS macos-rdp-daemon DESTINATION /usr/local/sbin)

@@ -4,14 +4,43 @@ This is the P0 from `docs/freerdp-server-audit.md`: there is **no authentication
 before the cliprdr/rdpsnd/gfx parsers and the input injector run, because NLA was
 disabled. This documents *why*, the build fix, and the exact app-side changes.
 
-> **Scope note.** The one change already applied to the code is honoring a failed
-> certificate load (`peer_apply_settings` now returns `bool` and
-> `rdp_peer_create` aborts) — it only affects the missing-cert path and does not
-> touch connection negotiation. Everything else below is a **reviewed, ready-to-
-> apply design**: it changes the (historically fragile) TLS/NLA negotiation and
-> the static OpenSSL build, neither of which can be compiled or tested from the
-> Linux CI container these notes were written in. Validate on a real macOS build
-> against `mstsc` before merging.
+> **Scope note.** The authenticated path is now **implemented but gated behind
+> the `MACOS_RDP_ENABLE_NLA` CMake option (default OFF)**. With the option OFF —
+> the default build, CI, and the current installer — the security configuration
+> is byte-for-behavior identical to before (TLS + legacy RDP, no auth), so there
+> is no connectivity regression risk. Turning the option ON compiles the NLA
+> path and requires an OpenSSL that exposes the legacy provider. The OpenSSL
+> build changes and the NLA handshake itself **cannot be compiled or tested from
+> the Linux CI container these notes were written in**, so validate the
+> `-DMACOS_RDP_ENABLE_NLA` build on real macOS against `mstsc` before relying on
+> it. The always-on safe change is honoring a failed certificate load
+> (`peer_apply_settings` now returns `bool`; `rdp_peer_create` aborts).
+
+## What's now in the tree
+
+| File | Role |
+|---|---|
+| `protocol/RDPSecurity.{h,c}` | `rdp_security_init_crypto()` (load legacy provider + probe MD4), `rdp_security_load_credentials()` |
+| `protocol/RDPPeer.c` | security block gated on `MACOS_RDP_ENABLE_NLA` + credentials; one-time crypto init; honors cert-load failure |
+| `scripts/set-rdp-credentials.sh` | provisions `/etc/macos-rdp/credentials` storing only the NTLM hash (self-contained MD4, verified against standard vectors) |
+| `CMakeLists.txt` | `MACOS_RDP_ENABLE_NLA` option; conditional OpenSSL include/link + legacy archives |
+
+### Turning it on
+
+```bash
+# 1. Build OpenSSL so liblegacy.a / libcommon.a are available (see "Fix part 1").
+# 2. Configure with NLA:
+cmake -B build -DMACOS_RDP_ENABLE_NLA=ON [-DMACOS_RDP_STATIC=ON -DFREERDP_STATIC_INSTALL=... -DOPENSSL_ROOT_DIR=...]
+cmake --build build
+# 3. Provision a credential (stores only the NTLM hash):
+sudo ./scripts/set-rdp-credentials.sh myuser
+# 4. Restart the daemon; it logs "NLA enabled — authenticating user 'myuser'".
+```
+
+If `MACOS_RDP_ENABLE_NLA=ON` but no credential is provisioned (or MD4 is
+unavailable), the daemon logs a loud `SECURITY: ... UNAUTHENTICATED` warning and
+falls back to the current TLS-only behavior rather than refusing all
+connections — change this to fail-closed if you prefer.
 
 ## Why NLA was disabled (root cause)
 

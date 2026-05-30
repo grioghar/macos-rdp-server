@@ -1,6 +1,7 @@
 #define RDP_LOG_COMPONENT "peer"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+#include "protocol/RDPSecurity.h"
 
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
@@ -70,15 +71,44 @@ static bool peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_GfxSmallCache,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_GfxThinClient,           FALSE);
     freerdp_settings_set_bool(s,   FreeRDP_RemoteFxCodec,           FALSE);
-    /* Security: match the known-good sample-server config. Crucially disable
-     * NLA — it requires NTLM/md4, which our minimal OpenSSL build omits (the
-     * "md4 NTLM support not available" log line). Offer TLS (+ legacy RDP as a
-     * fallback) so mstsc negotiates TLS. */
+    /* ── Security layer ─────────────────────────────────────────────────────
+     * Default build: offer TLS (+ legacy RDP as a fallback) with no
+     * authentication — the historically known-good config that lets mstsc
+     * negotiate TLS. NLA stays off because it needs NTLM/MD4, which the minimal
+     * OpenSSL build omits ("md4 NTLM support not available").
+     *
+     * NLA build (-DMACOS_RDP_ENABLE_NLA + an OpenSSL legacy provider): when a
+     * credential is provisioned in /etc/macos-rdp/credentials, require TLS+NLA
+     * and authenticate the client. This single switch gates the channel parsers
+     * and the input injector behind authentication. See docs/enabling-nla.md. */
     freerdp_settings_set_bool(s,   FreeRDP_UseRdpSecurityLayer,     FALSE);
+#ifdef MACOS_RDP_ENABLE_NLA
+    struct rdp_credentials cred;
+    if (rdp_security_md4_available() && rdp_security_load_credentials(&cred)) {
+        freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,         FALSE);
+        freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,         TRUE);
+        freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,         TRUE);
+        freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,         2);
+        freerdp_settings_set_uint32(s, FreeRDP_EncryptionLevel,     ENCRYPTION_LEVEL_HIGH);
+        freerdp_settings_set_string(s, FreeRDP_Username,            cred.username);
+        freerdp_settings_set_string(s, FreeRDP_PasswordHash,        cred.password_hash);
+        rdp_info("NLA enabled — authenticating user '%s'", cred.username);
+    } else {
+        freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,         TRUE);
+        freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,         TRUE);
+        freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,         FALSE);
+        freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,         1);
+        rdp_error("SECURITY: NLA build active but %s — connections are "
+                  "UNAUTHENTICATED; provision /etc/macos-rdp/credentials",
+                  rdp_security_md4_available() ? "no credential configured"
+                                               : "MD4/NTLM unavailable");
+    }
+#else
     freerdp_settings_set_bool(s,   FreeRDP_RdpSecurity,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_TlsSecurity,             TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_NlaSecurity,             FALSE);
     freerdp_settings_set_uint32(s, FreeRDP_TlsSecLevel,             1);
+#endif
     freerdp_settings_set_uint32(s, FreeRDP_ColorDepth,              32);
     freerdp_settings_set_bool(s,   FreeRDP_UnicodeInput,            TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
@@ -363,6 +393,7 @@ static void register_freerdp_wts(void) {
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     winpr_InitializeSSL(WINPR_SSL_INIT_DEFAULT);
+    rdp_security_init_crypto(); /* activates NTLM/MD4; no-op unless built with NLA */
     pthread_once(&g_wts_once, register_freerdp_wts);
     rdp_verbose("creating peer for fd=%d", fd);
 

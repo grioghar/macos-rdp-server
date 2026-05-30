@@ -334,7 +334,13 @@ static BOOL peer_activate(freerdp_peer *peer) {
  * the first WTSOpenServerA. Without this, WinPR's WTS layer tries to dlopen the
  * external FreeRDS plugin (libfreerds-fdsapi.so, Linux-only, absent on macOS),
  * WTSOpenServerA returns NULL, and every connection dies in context_new with
- * "ContextNew callback failed". The sample server does the same (sfreerdp.c). */
+ * "ContextNew callback failed". The sample server does the same (sfreerdp.c).
+ *
+ * FreeRDP_InitWtsApi is exported by libfreerdp-server but only declared in an
+ * internal header the public SDK does not ship, so we forward-declare it. The
+ * signature matches WinPR's INIT_WTSAPI_FN typedef. */
+extern const WtsApiFunctionTable *FreeRDP_InitWtsApi(void);
+
 static pthread_once_t g_wts_once = PTHREAD_ONCE_INIT;
 static void register_freerdp_wts(void) {
     WTSRegisterWtsApiFunctionTable(FreeRDP_InitWtsApi());

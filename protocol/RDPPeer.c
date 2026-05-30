@@ -10,6 +10,7 @@
 #include <freerdp/server/server-common.h>
 #include <freerdp/channels/rdpgfx.h>
 #include <freerdp/channels/wtsvc.h>
+#include <freerdp/channels/drdynvc.h>
 #include <freerdp/crypto/certificate.h>
 #include <freerdp/crypto/privatekey.h>
 #include <winpr/ssl.h>
@@ -261,17 +262,17 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     rdp_verbose("post-connect: opening virtual channels");
 
-    /* GFX — dynamic virtual channel, runs in its own internal thread. */
+    /* GFX is a DYNAMIC virtual channel: it can only be opened once drdynvc has
+     * reached DRDYNVC_STATE_READY, which does NOT happen until after PostConnect.
+     * Opening here fails with "WTSVirtualChannelOpenEx failed" and the client
+     * gets no video (black screen). Create the context now; defer Open() to the
+     * run loop, which opens it when drdynvc is ready. */
     ctx->gfx = rdpgfx_server_context_new(ctx->vcm);
     if (!ctx->gfx) { rdp_error("rdpgfx_server_context_new failed"); return FALSE; }
     ctx->gfx->custom        = ctx;
     ctx->gfx->CapsAdvertise = gfx_caps_advertise;
     ctx->surfaceId          = 1;
-    if (!ctx->gfx->Open(ctx->gfx)) {
-        rdp_verbose("GFX channel open failed — client may not support it");
-        rdpgfx_server_context_free(ctx->gfx);
-        ctx->gfx = NULL;
-    } else { rdp_verbose("GFX channel opened"); }
+    rdp_verbose("GFX context created; open deferred until drdynvc ready");
 
     /* Clipboard. */
     ctx->cliprdr = cliprdr_server_context_new(ctx->vcm);
@@ -421,8 +422,8 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
     HANDLE vcmEvent = WTSVirtualChannelManagerGetEventHandle(ctx->vcm);
     if (vcmEvent) events[nCount++] = vcmEvent;
 
-    /* GFX channel event (when GFX is open and uses external event). */
-    if (ctx->gfx) {
+    /* GFX channel event (only once the DVC is actually open). */
+    if (ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent) events[nCount++] = gfxEvent;
     }
@@ -439,7 +440,8 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         return false;
     }
 
-    /* Dispatch any pending virtual channel messages. */
+    /* Dispatch any pending virtual channel messages. This also advances the
+     * drdynvc state machine toward READY. */
     if (vcmEvent && WaitForSingleObject(vcmEvent, 0) == WAIT_OBJECT_0) {
         if (!WTSVirtualChannelManagerCheckFileDescriptor(ctx->vcm)) {
             rdp_error("VCM check failed");
@@ -447,8 +449,21 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Drain GFX channel messages. */
-    if (ctx->gfx) {
+    /* Open the GFX dynamic virtual channel once drdynvc is READY. GFX cannot be
+     * opened in PostConnect (drdynvc isn't up yet) — doing it here is how the
+     * shadow server brings up DVCs. Without this the client gets no video. */
+    if (ctx->gfx && !ctx->gfxOpened &&
+        WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
+        if (ctx->gfx->Open(ctx->gfx)) {
+            ctx->gfxOpened = true;
+            rdp_info("GFX channel opened (drdynvc ready)");
+        } else {
+            rdp_error("GFX Open failed despite drdynvc ready");
+        }
+    }
+
+    /* Drain GFX channel messages once the channel is open. */
+    if (ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0)
             rdpgfx_server_handle_messages(ctx->gfx);

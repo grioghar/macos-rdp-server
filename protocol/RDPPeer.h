@@ -34,7 +34,8 @@ struct rdp_peer_context {
     CliprdrServerContext *cliprdr;
     RdpsndServerContext  *rdpsnd;
     uint32_t             surfaceId;
-    bool                 gfxReady;
+    bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
+    bool                 gfxReady;   /* client sent GFX caps; surface mapped */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
     /* Clipboard: the host's current data, advertised via Format List and held

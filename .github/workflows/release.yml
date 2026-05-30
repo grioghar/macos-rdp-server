@@ -11,9 +11,17 @@ on:
         required: true
 
 jobs:
-  build-and-release:
-    name: Build universal binary and release
-    runs-on: macos-14
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-14
+          - arch: x86_64
+            runner: macos-13
 
     steps:
       - name: Checkout
@@ -28,14 +36,14 @@ jobs:
         id: freerdp-ver
         run: echo "ver=$(tr -d '[:space:]' < .github/freerdp-version)" >> "$GITHUB_OUTPUT"
 
-      - name: Cache FreeRDP universal static build
+      - name: Cache FreeRDP static build
         id: cache-freerdp
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-universal-static-v1
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-${{ matrix.arch }}-static-v4
 
-      - name: Build FreeRDP (universal static)
+      - name: Build FreeRDP (static)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
         env:
           FREERDP_VER: ${{ steps.freerdp-ver.outputs.ver }}
@@ -49,11 +57,12 @@ jobs:
             -DCMAKE_C_FLAGS="-Os" \
             -DCMAKE_CXX_FLAGS="-Os" \
             -DCMAKE_INSTALL_PREFIX="$INSTALL" \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
             -DCMAKE_PREFIX_PATH="$OPENSSL_ROOT" \
             -DBUILD_SHARED_LIBS=OFF \
             -DWITH_SERVER=ON \
+            -DWITH_PLATFORM_SERVER=OFF \
             -DWITH_CLIENT=OFF \
             -DWITH_CLIENT_COMMON=OFF \
             -DWITH_PROXY=OFF \
@@ -94,12 +103,12 @@ jobs:
           cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
           cmake --install "$SRC/build"
 
-      - name: Build macos-rdp-daemon (universal)
+      - name: Build macos-rdp-daemon
         run: |
           set -euo pipefail
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_ARCHITECTURES="${{ matrix.arch }}" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
             -DMACOS_RDP_STATIC=ON \
             -DFREERDP_STATIC_INSTALL="$HOME/freerdp-install" \
@@ -108,18 +117,49 @@ jobs:
             -DOPENSSL_USE_STATIC_LIBS=TRUE
           cmake --build build --parallel "$(sysctl -n hw.logicalcpu)"
 
-      - name: Verify and strip binary
+      - name: Verify binary
         run: |
           BIN=build/macos-rdp-daemon
-          lipo -info "$BIN"
+          file "$BIN"
           otool -L "$BIN"
           EXTERNAL=$(otool -L "$BIN" | tail -n +2 | awk '{print $1}' | grep -Ev '^(/usr/lib/|/System/|@)' || true)
           if [[ -n "$EXTERNAL" ]]; then echo "Non-system deps: $EXTERNAL"; exit 1; fi
           strip -x "$BIN"
-          ls -lh "$BIN"
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-${{ matrix.arch }}
+          path: build/macos-rdp-daemon
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Create universal binary
+        run: |
+          chmod +x dist/daemon-arm64/macos-rdp-daemon dist/daemon-x86_64/macos-rdp-daemon
+          lipo -create \
+            dist/daemon-arm64/macos-rdp-daemon \
+            dist/daemon-x86_64/macos-rdp-daemon \
+            -output dist/macos-rdp-daemon
+          lipo -info dist/macos-rdp-daemon
+          ls -lh dist/macos-rdp-daemon
 
       - name: Compute checksum
-        run: shasum -a 256 build/macos-rdp-daemon > build/SHA256SUMS
+        run: shasum -a 256 dist/macos-rdp-daemon > dist/SHA256SUMS
 
       - name: Determine tag
         id: tag
@@ -146,5 +186,5 @@ jobs:
           gh release create "$TAG" \
             --title "macos-rdp-server $TAG" \
             --notes-file /tmp/release-notes.md \
-            build/macos-rdp-daemon \
-            build/SHA256SUMS
+            dist/macos-rdp-daemon \
+            dist/SHA256SUMS

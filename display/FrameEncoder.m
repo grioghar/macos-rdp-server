@@ -12,6 +12,10 @@
 @property (nonatomic, assign) uint32_t bitrateKbps;
 @property (nonatomic, assign) int64_t  frameIndex;
 @property (nonatomic, assign) uint64_t bytesEncoded;
+/* Reusable Annex-B assembly buffer. VideoToolbox delivers output frames
+ * serially on one callback thread, so a single buffer reset per frame
+ * avoids a heap allocation + grow on every frame (60/sec). */
+@property (nonatomic, strong) NSMutableData *annexBuffer;
 @end
 
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
@@ -40,6 +44,8 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
                       bitrate:(uint32_t)bitrateKbps {
     if ((self = [super init])) {
         _w = width; _h = height; _bitrateKbps = bitrateKbps;
+        /* Pre-size to a typical compressed frame; grows on demand if needed. */
+        _annexBuffer = [[NSMutableData alloc] initWithCapacity:512 * 1024];
     }
     return self;
 }
@@ -115,7 +121,10 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
         isKey = !CFDictionaryContainsKey(dict, kCMSampleAttachmentKey_NotSync);
     }
 
-    NSMutableData *annexB = [NSMutableData data];
+    /* Reuse the buffer: setLength:0 keeps the allocated capacity, so steady
+     * state does zero heap allocation per frame. */
+    NSMutableData *annexB = self.annexBuffer;
+    annexB.length = 0;
 
     if (isKey) {
         CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(buf);

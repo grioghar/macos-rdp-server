@@ -86,6 +86,7 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework CoreVideo"
     "-framework VideoToolbox"
     "-framework CoreMedia"
+    "-framework ScreenCaptureKit"
     "-framework CoreAudio"
     "-framework AudioToolbox"
     "-framework AppKit"

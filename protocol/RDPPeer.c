@@ -387,6 +387,32 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     return TRUE;
 }
 
+/* Client minimized / restored its RDP window. mstsc sends Suppress Output
+ * (allow=FALSE) on minimize and again (allow=TRUE) on restore. While suppressed
+ * we must STOP sending graphics; on restore we must resume AND send a fresh
+ * keyframe — the client discarded everything while minimized, so a delta would
+ * reference frames it no longer has (black until the next IDR). Without this the
+ * window comes back black. */
+static BOOL peer_suppress_output(rdpContext *context, BYTE allow,
+                                 const RECTANGLE_16 *area) {
+    (void)area;
+    RDPPeerContext *ctx = (RDPPeerContext *)context;
+    if (allow) {
+        ctx->outputSuppressed = false;
+        /* Force a self-contained refresh so the restored window decodes. */
+        ctx->sentKeyframe = false;
+        if (ctx->callbacks.onKeyframeRequest) {
+            ctx->keyframeRequested = true;
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
+        }
+        rdp_verbose("client output ALLOWED (restored) — forcing keyframe");
+    } else {
+        ctx->outputSuppressed = true;
+        rdp_verbose("client output SUPPRESSED (minimized) — pausing frames");
+    }
+    return TRUE;
+}
+
 static BOOL peer_activate(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     ctx->activated = true;
@@ -443,6 +469,9 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks) {
     peer_apply_settings(peer);
     peer->PostConnect = peer_post_connect;
     peer->Activate    = peer_activate;
+    /* Handle minimize/restore (Suppress Output) so the window doesn't come back
+     * black. SuppressOutput lives on rdpUpdate in 3.x. */
+    peer->context->update->SuppressOutput = peer_suppress_output;
 
     /* Input is on rdpContext, not on freerdp_peer in 3.x. */
     peer->context->input->KeyboardEvent      = peer_keyboard;
@@ -557,6 +586,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
                                uint16_t dirtyW, uint16_t dirtyH) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
+
+    /* Client minimized: it ignores (and may choke on) graphics while output is
+     * suppressed. Drop frames until it restores (which forces a fresh keyframe). */
+    if (ctx->outputSuppressed) return true;
 
     /* The first frame the client receives MUST be a self-contained keyframe.
      * Frames encoded while the GFX channel was still opening were discarded, so a

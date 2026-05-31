@@ -55,6 +55,7 @@ struct rdp_peer_context {
     bool                 gfxReady;   /* client sent GFX caps; surface mapped */
     bool                 sentKeyframe;     /* a keyframe has been sent this session */
     bool                 keyframeRequested;/* debounce: requested an IDR, awaiting it */
+    bool                 outputSuppressed; /* client minimized: Suppress Output PDU -> pause sends */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
     /* Clipboard: the host's current data, advertised via Format List and held

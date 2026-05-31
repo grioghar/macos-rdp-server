@@ -88,3 +88,18 @@ jobs:
           path: build/macos-rdp-daemon
           retention-days: 3
           if-no-files-found: error
+
+  # Separate, additive job: compile the Swift/AppKit menu-bar config app.
+  # Independent of the daemon build above so it can never break it.
+  build-gui:
+    name: Compile GUI config app (Swift)
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show Swift version
+        run: swift --version
+
+      - name: Compile menu-bar app
+        run: ./gui/build.sh --compile-only

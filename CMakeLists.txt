@@ -61,6 +61,7 @@ add_executable(macos-rdp-daemon
     daemon/main.m
     daemon/RDPServer.m
     daemon/RDPSession.m
+    daemon/DisplayControl.m
     protocol/RDPPeer.c
     display/VirtualDisplay.m
     display/ScreenCapture.m

@@ -67,6 +67,26 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
     int32_t bitrate = (int32_t)(_bitrateKbps * 1000);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AverageBitRate,
                          (__bridge CFTypeRef)@(bitrate));
+
+    /* HARD burst cap. AverageBitRate is only a long-term target — VideoToolbox
+     * still spikes to ~95KB frames on big screen changes. Those bursts (300KB+ in
+     * ~150ms, ~20Mbps instantaneous) overran the RDPGFX channel and desynced
+     * mstsc's decoder ("Invalid format ... packet of type Unknown", disconnect
+     * Reason 3334). DataRateLimits = {maxBytes, seconds} forces VT to compress
+     * harder so no 0.25s window exceeds the configured rate. The short window is
+     * deliberate: a 1s window would let a sub-second burst through. */
+    {
+        double   windowSec = 0.25;
+        int32_t  capBytes  = (int32_t)((double)_bitrateKbps * 1000.0 / 8.0 * windowSec);
+        CFNumberRef capNum = CFNumberCreate(NULL, kCFNumberSInt32Type, &capBytes);
+        CFNumberRef winNum = CFNumberCreate(NULL, kCFNumberDoubleType, &windowSec);
+        const void *vals[2] = { capNum, winNum };
+        CFArrayRef  limits  = CFArrayCreate(NULL, vals, 2, &kCFTypeArrayCallBacks);
+        VTSessionSetProperty(_session, kVTCompressionPropertyKey_DataRateLimits, limits);
+        CFRelease(limits); CFRelease(capNum); CFRelease(winNum);
+        rdp_verbose("DataRateLimits: %d bytes / %.2fs (burst cap)", capBytes, windowSec);
+    }
+
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_RealTime,           kCFBooleanTrue);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
     VTSessionSetProperty(_session, kVTCompressionPropertyKey_ProfileLevel,

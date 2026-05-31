@@ -98,7 +98,11 @@ static void peer_apply_settings(freerdp_peer *peer) {
 
 static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
     RDPPeerContext *c = (RDPPeerContext *)ctx;
-    pthread_mutex_init(&c->gfxLock, NULL);
+    pthread_mutexattr_t mattr;
+    pthread_mutexattr_init(&mattr);
+    pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&c->xportLock, &mattr);
+    pthread_mutexattr_destroy(&mattr);
     /* Open the Virtual Channel Manager — all dynamic channels live under it. */
     c->vcm = WTSOpenServerA((LPSTR)peer->context);
     if (!c->vcm || c->vcm == INVALID_HANDLE_VALUE) {
@@ -117,7 +121,7 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
     if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
-    pthread_mutex_destroy(&c->gfxLock);
+    pthread_mutex_destroy(&c->xportLock);
     rdp_debug("peer context freed");
 }
 
@@ -495,25 +499,35 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         return false;
     }
 
+    /* Everything below WRITES to the transport (CheckFileDescriptor sends acks +
+     * input responses, the VCM pump flushes channel PDUs incl. cliprdr, GFX
+     * handle_messages drains/answers). Hold xportLock across the whole section so
+     * none of it interleaves with the encoder thread's SurfaceCommand, the audio
+     * thread's SendSamples, or the clipboard thread's ServerFormatList. The 50ms
+     * Wait above is deliberately OUTSIDE the lock so we don't starve those threads
+     * while idle. */
+    bool ok = true;
+    pthread_mutex_lock(&ctx->xportLock);
+
     /* Process peer transport data. */
     if (!peer->CheckFileDescriptor(peer)) {
         rdp_verbose("peer transport closed");
-        return false;
+        ok = false;
     }
 
     /* Dispatch any pending virtual channel messages. This also advances the
      * drdynvc state machine toward READY. */
-    if (vcmEvent && WaitForSingleObject(vcmEvent, 0) == WAIT_OBJECT_0) {
+    if (ok && vcmEvent && WaitForSingleObject(vcmEvent, 0) == WAIT_OBJECT_0) {
         if (!WTSVirtualChannelManagerCheckFileDescriptor(ctx->vcm)) {
             rdp_error("VCM check failed");
-            return false;
+            ok = false;
         }
     }
 
     /* Open the GFX dynamic virtual channel once drdynvc is READY. GFX cannot be
      * opened in PostConnect (drdynvc isn't up yet) — doing it here is how the
      * shadow server brings up DVCs. Without this the client gets no video. */
-    if (ctx->gfx && !ctx->gfxOpened &&
+    if (ok && ctx->gfx && !ctx->gfxOpened &&
         WTSVirtualChannelManagerGetDrdynvcState(ctx->vcm) == DRDYNVC_STATE_READY) {
         if (ctx->gfx->Open(ctx->gfx)) {
             ctx->gfxOpened = true;
@@ -523,18 +537,16 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         }
     }
 
-    /* Drain GFX channel messages once the channel is open. Serialized against
-     * the encoder thread's SurfaceCommand via gfxLock (shared send_stream/zgfx). */
-    if (ctx->gfx && ctx->gfxOpened) {
+    /* Drain GFX channel messages once the channel is open. */
+    if (ok && ctx->gfx && ctx->gfxOpened) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0) {
-            pthread_mutex_lock(&ctx->gfxLock);
             rdpgfx_server_handle_messages(ctx->gfx);
-            pthread_mutex_unlock(&ctx->gfxLock);
         }
     }
 
-    return true;
+    pthread_mutex_unlock(&ctx->xportLock);
+    return ok;
 }
 
 bool rdp_peer_send_h264_frame(freerdp_peer *peer,
@@ -619,10 +631,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     RDPGFX_END_FRAME_PDU endFrame = {0};
     endFrame.frameId = fid;
 
-    /* Serialize against the run-loop's handle_messages (shared GFX state). */
-    pthread_mutex_lock(&ctx->gfxLock);
+    /* Serialize against ALL other transport writers (run loop, cliprdr, audio). */
+    pthread_mutex_lock(&ctx->xportLock);
     UINT rc = ctx->gfx->SurfaceFrameCommand(ctx->gfx, &cmd, &startFrame, &endFrame);
-    pthread_mutex_unlock(&ctx->gfxLock);
+    pthread_mutex_unlock(&ctx->xportLock);
     if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceFrameCommand failed: %u", rc); return false; }
     rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
               isKeyFrame ? "key" : "delta",
@@ -636,11 +648,14 @@ void rdp_peer_send_default_cursor(freerdp_peer *peer) {
      * draw + move the cursor locally at the mouse's native rate (smooth), like a
      * Windows RDP server. (Showing the actual Mac cursor shapes lag-free would
      * need full color-pointer PDUs built from the captured cursor — a follow-up.) */
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     rdpPointerUpdate *pointer = peer->context->update->pointer;
     if (!pointer || !pointer->PointerSystem) return;
     POINTER_SYSTEM_UPDATE sys = {0};
     sys.type = SYSPTR_DEFAULT;
+    pthread_mutex_lock(&ctx->xportLock);
     pointer->PointerSystem(peer->context, &sys);
+    pthread_mutex_unlock(&ctx->xportLock);
     rdp_verbose("sent default system pointer (client-side cursor)");
 }
 
@@ -666,9 +681,12 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->rdpsnd || !ctx->audioReady) return false;
-    /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature. */
-    return ctx->rdpsnd->SendSamples(ctx->rdpsnd, samples, frame_count, 0)
-           == CHANNEL_RC_OK;
+    /* SendSamples(context, buf, nframes, timestamp) — real 3.x signature.
+     * Audio runs on its own capture thread; serialize against the transport. */
+    pthread_mutex_lock(&ctx->xportLock);
+    UINT rc = ctx->rdpsnd->SendSamples(ctx->rdpsnd, samples, frame_count, 0);
+    pthread_mutex_unlock(&ctx->xportLock);
+    return rc == CHANNEL_RC_OK;
 }
 
 bool rdp_peer_send_clipboard(freerdp_peer *peer,
@@ -693,7 +711,10 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     list.common.msgFlags = CB_RESPONSE_OK;
     list.numFormats      = 1;
     list.formats         = &fmt;
+    /* Called from the clipboard poll thread; serialize against the transport. */
+    pthread_mutex_lock(&ctx->xportLock);
     ctx->cliprdr->ServerFormatList(ctx->cliprdr, &list);
+    pthread_mutex_unlock(&ctx->xportLock);
     rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
     return true;
 }

@@ -41,10 +41,16 @@ struct rdp_peer_context {
     RdpsndServerContext  *rdpsnd;
     uint32_t             surfaceId;
     uint32_t             frameId;    /* monotonic GFX frame id for StartFrame/EndFrame */
-    /* Serializes ALL access to the GFX context (SurfaceCommand from the encoder
-     * thread vs handle_messages from the run-loop thread). The GFX channel is
-     * also put in external-thread mode so its internal thread never runs. */
-    pthread_mutex_t      gfxLock;
+    /* Serializes ALL writes to the single RDP transport (TLS socket). FreeRDP is
+     * NOT thread-safe for concurrent sends: the encoder thread (GFX SurfaceCommand),
+     * the run-loop thread (CheckFileDescriptor + VCM pump + GFX handle_messages),
+     * the clipboard poll thread (cliprdr ServerFormatList) and the audio thread
+     * (rdpsnd SendSamples) all write the same socket. Unsynchronized, their bytes
+     * interleave and the GFX bytestream desyncs -> mstsc decodes a "packet of type
+     * Unknown" and drops the session (Reason 3334). Every transport write MUST hold
+     * this lock. RECURSIVE so a run-loop callback (e.g. cliprdr) can re-enter while
+     * the loop already holds it. */
+    pthread_mutex_t      xportLock;
     bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
     bool                 gfxReady;   /* client sent GFX caps; surface mapped */
     bool                 sentKeyframe;     /* a keyframe has been sent this session */

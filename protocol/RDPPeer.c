@@ -893,37 +893,47 @@ void rdp_peer_send_cursor_shape(freerdp_peer *peer,
     if (hotY >= h) hotY = (uint16_t)(h - 1);
 
     /* ── Build the XOR (color) mask ───────────────────────────────────────
-     * RDP wants 32bpp BGRA scanlines BOTTOM-UP, each row DWORD-aligned. For
-     * 32bpp a row is w*4 bytes (already 4-byte aligned). Our input is top-down
-     * BGRA premultiplied, so we emit rows in reverse order. */
-    uint32_t xorStride = w * 4;
-    uint32_t xorLen    = xorStride * h;
+     * mstsc renders 32bpp/alpha color pointers UNRELIABLY (it draws nothing —
+     * the cursor is invisible even though the PDUs are well-formed). We
+     * therefore emit a CLASSIC 24bpp BGR color pointer, which mstsc renders
+     * reliably (MS-RDPBCGR 2.2.9.1.1.4.4). Layout: 3 bytes/pixel (B,G,R, no
+     * alpha), scanlines BOTTOM-UP, each row padded to a 2-byte (WORD) boundary.
+     * Our input is top-down BGRA premultiplied, so we emit rows in reverse and
+     * drop the alpha byte. Because alpha is premultiplied, (semi-)transparent
+     * pixels are already darkened toward black; the AND mask masks them out, so
+     * the dropped alpha costs nothing visible. */
+    const uint32_t xorBpp = 24;
+    uint32_t xorRowBytes = w * 3u;
+    xorRowBytes = (xorRowBytes + 1u) & ~1u;          /* pad to 2 bytes (WORD) */
+    uint32_t xorLen = xorRowBytes * h;
 
     /* ── Build the AND (transparency) mask ────────────────────────────────
      * 1bpp, BOTTOM-UP, each scanline padded to a 2-byte boundary. A SET bit
      * means "transparent" (client shows the underlying pixel). Derive it from
-     * alpha: alpha==0 -> transparent (bit 1), else opaque (bit 0). With a
-     * proper 32bpp alpha xor mask mstsc alpha-blends anyway, but a correct AND
-     * mask keeps fully transparent corners from painting black on clients that
-     * ignore alpha. */
+     * alpha: a (near-)transparent pixel -> transparent (bit 1), else opaque
+     * (bit 0). We treat alpha < 128 as transparent so the dark fringe of
+     * premultiplied anti-aliased edges is masked out rather than painted. */
     uint32_t andRowBytes = ((w + 7u) / 8u);
     andRowBytes = (andRowBytes + 1u) & ~1u;          /* pad to 2 bytes */
     uint32_t andLen = andRowBytes * h;
 
-    uint8_t *xorData = (uint8_t *)malloc(xorLen);
+    /* calloc so the WORD-padding bytes at the end of each xor row stay 0. */
+    uint8_t *xorData = (uint8_t *)calloc(1, xorLen);
     uint8_t *andData = (uint8_t *)calloc(1, andLen); /* default opaque (0) */
     if (!xorData || !andData) { free(xorData); free(andData); return; }
 
     for (uint32_t y = 0; y < h; y++) {
-        const uint8_t *srcRow = bgra + (size_t)y * xorStride;
+        const uint8_t *srcRow = bgra + (size_t)y * (w * 4u);
         /* bottom-up: source row y goes to dest row (h-1-y). */
-        uint8_t *dstRow = xorData + (size_t)(h - 1 - y) * xorStride;
-        memcpy(dstRow, srcRow, xorStride);
-
+        uint8_t *dstRow = xorData + (size_t)(h - 1 - y) * xorRowBytes;
         uint8_t *andRow = andData + (size_t)(h - 1 - y) * andRowBytes;
         for (uint32_t x = 0; x < w; x++) {
-            uint8_t alpha = srcRow[x * 4 + 3];   /* BGRA -> A at +3 */
-            if (alpha == 0) {
+            const uint8_t *px  = srcRow + (size_t)x * 4;   /* B,G,R,A */
+            uint8_t       *dpx = dstRow + (size_t)x * 3;   /* B,G,R   */
+            dpx[0] = px[0];
+            dpx[1] = px[1];
+            dpx[2] = px[2];
+            if (px[3] < 128) {   /* BGRA -> A at +3; <128 == (near-)transparent */
                 /* MSB-first bit order within each byte. */
                 andRow[x / 8] |= (uint8_t)(0x80u >> (x % 8));
             }
@@ -937,21 +947,21 @@ void rdp_peer_send_cursor_shape(freerdp_peer *peer,
     if (w <= RDP_CURSOR_NEW_MAX && h <= RDP_CURSOR_NEW_MAX) {
         if (pointer->PointerNew) {
             POINTER_NEW_UPDATE upd = {0};
-            upd.xorBpp = 32;
+            upd.xorBpp = (UINT16)xorBpp;
             upd.colorPtrAttr.cacheIndex    = 0;
             upd.colorPtrAttr.hotSpotX      = hotX;
             upd.colorPtrAttr.hotSpotY      = hotY;
             upd.colorPtrAttr.width         = (UINT16)w;
             upd.colorPtrAttr.height        = (UINT16)h;
-            upd.colorPtrAttr.lengthAndMask = (UINT16)andLen;
-            upd.colorPtrAttr.lengthXorMask = (UINT16)xorLen;
+            upd.colorPtrAttr.lengthAndMask = andLen;
+            upd.colorPtrAttr.lengthXorMask = xorLen;
             upd.colorPtrAttr.xorMaskData   = xorData;
             upd.colorPtrAttr.andMaskData   = andData;
             ok = pointer->PointerNew(peer->context, &upd) ? true : false;
         }
     } else if (pointer->PointerLarge) {
         POINTER_LARGE_UPDATE upd = {0};
-        upd.xorBpp        = 32;
+        upd.xorBpp        = (UINT16)xorBpp;
         upd.cacheIndex    = 0;
         upd.hotSpotX      = hotX;
         upd.hotSpotY      = hotY;
@@ -969,8 +979,8 @@ void rdp_peer_send_cursor_shape(freerdp_peer *peer,
     free(andData);
 
     if (!ok) rdp_error("cursor send failed (rc=%u, %ux%u)", rc, w, h);
-    else     rdp_debug("sent cursor %ux%u hot=(%u,%u) xor=%u and=%u",
-                       w, h, hotX, hotY, xorLen, andLen);
+    else     rdp_debug("sent cursor %ux%u hot=(%u,%u) xorBpp=%u xor=%u and=%u",
+                       w, h, hotX, hotY, xorBpp, xorLen, andLen);
 }
 
 bool rdp_peer_send_bitmap(freerdp_peer *peer,

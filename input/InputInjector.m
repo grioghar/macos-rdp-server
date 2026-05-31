@@ -127,13 +127,28 @@ static const uint16_t kExtScanToVK[256] = {
 
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y {
     /* The client sends pointer coords in the RDP desktop space (0..srcW, 0..srcH).
-     * Scale them to the Mac display's actual point bounds — these differ on a Retina
-     * or differently-sized display, so a 1:1 map lands clicks in the wrong place. */
+     * The capture preserves the Mac's aspect ratio inside that surface, so the Mac
+     * image occupies a CENTERED sub-rectangle with letterbox/pillarbox bars when the
+     * client and Mac aspect ratios differ. Map the pointer into that content rect
+     * (not the whole surface), then to the Mac display's point bounds — otherwise the
+     * bars throw off the cursor position. */
     CGRect bounds = CGDisplayBounds(_displayID);
-    double sx = (_srcW > 0) ? bounds.size.width  / (double)_srcW : 1.0;
-    double sy = (_srcH > 0) ? bounds.size.height / (double)_srcH : 1.0;
-    CGPoint pos = CGPointMake(bounds.origin.x + (double)x * sx,
-                              bounds.origin.y + (double)y * sy);
+    double macAspect  = bounds.size.width / bounds.size.height;
+    double surfAspect = (_srcH > 0) ? (double)_srcW / (double)_srcH : macAspect;
+    double contentW, contentH, offX, offY;
+    if (macAspect < surfAspect) {            /* pillarbox: content fits the height */
+        contentH = _srcH; contentW = (double)_srcH * macAspect;
+        offX = ((double)_srcW - contentW) / 2.0; offY = 0;
+    } else {                                  /* letterbox: content fits the width */
+        contentW = _srcW; contentH = (double)_srcW / macAspect;
+        offX = 0; offY = ((double)_srcH - contentH) / 2.0;
+    }
+    double fx = (contentW > 0) ? ((double)x - offX) / contentW : 0;  /* 0..1 in content */
+    double fy = (contentH > 0) ? ((double)y - offY) / contentH : 0;
+    if (fx < 0) fx = 0; else if (fx > 1) fx = 1;
+    if (fy < 0) fy = 0; else if (fy > 1) fy = 1;
+    CGPoint pos = CGPointMake(bounds.origin.x + fx * bounds.size.width,
+                              bounds.origin.y + fy * bounds.size.height);
 
     BOOL down = (flags & RDP_PTR_DOWN) != 0;
     CGEventType type;

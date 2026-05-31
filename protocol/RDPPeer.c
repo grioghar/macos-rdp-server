@@ -540,7 +540,10 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     RDPGFX_SURFACE_COMMAND cmd = {0};
     cmd.surfaceId = ctx->surfaceId;
     cmd.codecId   = RDPGFX_CODECID_AVC420;
-    cmd.format    = GFX_PIXEL_FORMAT_XRGB_8888;
+    /* cmd.format is a FreeRDP COLOR format (color.h), not a GFX wire enum.
+     * rdpgfx_write_surface_command only accepts BGRX32/BGRA32 (-> XRGB/ARGB
+     * on the wire). Using the wire enum yields "Format UNKNOWN not supported". */
+    cmd.format    = PIXEL_FORMAT_BGRX32;
     cmd.right     = (UINT16)width;
     cmd.bottom    = (UINT16)height;
     cmd.length    = (UINT32)len;

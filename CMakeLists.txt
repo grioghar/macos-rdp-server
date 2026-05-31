@@ -105,6 +105,18 @@ target_compile_options(macos-rdp-daemon PRIVATE
 # Link-time optimisation — dead-strips unused code across translation units.
 set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
+# Shrink the final executable (behavior-neutral):
+#   -dead_strip removes unreferenced code/data pulled in from the statically linked
+#     FreeRDP/OpenSSL archives — we use only a slice of them, so this is a large win
+#     that LTO alone can't get (LTO only spans our own translation units, not the .a libs).
+#   -x drops the local symbol table.
+# The binary is re-signed after build, so the changed contents don't affect the
+# certificate-pinned TCC grant.
+target_link_options(macos-rdp-daemon PRIVATE
+    -Wl,-dead_strip
+    -Wl,-x
+)
+
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.6"
 )

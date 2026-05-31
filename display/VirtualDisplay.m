@@ -1,4 +1,6 @@
 #import "display/VirtualDisplay.h"
+#import <CoreGraphics/CoreGraphics.h>
+#import <unistd.h>
 #define RDP_LOG_COMPONENT "display"
 #include "logging/RDPLog.h"
 
@@ -147,6 +149,24 @@
             _did = vdid;
             rdp_info("virtual display created: displayID=%u %ux%u (applied=%d)",
                      _did, _w, _h, applied);
+
+            /* Make the virtual display the MAIN display so the menu bar, Dock, and
+             * newly-opened windows land ON it. Otherwise apps open on the built-in
+             * screen, invisible to the RDP session ("windows never pop up"). Give the
+             * new display a moment to register, then put it at the global origin
+             * (0,0) = main, and move the former main (built-in) to its right. */
+            usleep(400000);
+            CGDirectDisplayID oldMain = CGMainDisplayID();
+            if (oldMain != _did) {
+                CGDisplayConfigRef dcfg = NULL;
+                if (CGBeginDisplayConfiguration(&dcfg) == kCGErrorSuccess) {
+                    CGConfigureDisplayOrigin(dcfg, _did, 0, 0);
+                    CGConfigureDisplayOrigin(dcfg, oldMain, (int32_t)_w, 0);
+                    CGError ce = CGCompleteDisplayConfiguration(dcfg, kCGConfigureForSession);
+                    rdp_info("virtual display %u set as main (built-in %u moved aside, rc=%d)",
+                             _did, oldMain, ce);
+                }
+            }
         } else {
             rdp_error("virtual display has no displayID — main display");
         }

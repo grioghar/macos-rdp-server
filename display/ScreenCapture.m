@@ -103,8 +103,12 @@
          * via RDP_SHOW_CURSOR=0 to hide it (e.g. if the client's own cursor is
          * preferred and the double-cursor is distracting). A GUI config tool can set
          * this env var in the LaunchAgent. */
+        /* Default to the client-drawn cursor (responsive). Compositing the Mac
+         * cursor into the video (RDP_SHOW_CURSOR=1) shows the real pointer shapes
+         * but lags badly — every move round-trips through encode/network/decode.
+         * (Lag-free Mac cursor needs RDP pointer-update PDUs — a planned follow-up.) */
         const char *showCur = getenv("RDP_SHOW_CURSOR");
-        cfg.showsCursor          = (showCur && showCur[0] == '0') ? NO : YES;
+        cfg.showsCursor          = (showCur && showCur[0] == '1') ? YES : NO;
 
         SCStream *stream = [[SCStream alloc] initWithFilter:filter
                                               configuration:cfg

@@ -66,6 +66,7 @@ add_executable(macos-rdp-daemon
     display/VirtualDisplay.m
     display/ScreenCapture.m
     display/FrameEncoder.m
+    display/CursorCapture.m
     input/InputInjector.m
     input/ClipboardSync.m
     audio/AudioCapture.m

@@ -4,6 +4,7 @@
 #import "display/VirtualDisplay.h"
 #import "display/ScreenCapture.h"
 #import "display/FrameEncoder.h"
+#import "display/CursorCapture.h"
 #import "input/InputInjector.h"
 #import "input/ClipboardSync.h"
 #import "audio/AudioCapture.h"
@@ -29,6 +30,7 @@ static const uint32_t kDefaultBitrate = 8000;
 @property (nonatomic, strong) InputInjector   *injector;
 @property (nonatomic, strong) ClipboardSync   *clipboard;
 @property (nonatomic, strong) AudioCapture    *audio;
+@property (nonatomic, strong) CursorCapture   *cursor;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue;
 @end
 
@@ -221,9 +223,21 @@ static void rdp_on_keyframe_request(void *ud) {
     _sessionState = RDPSessionStateActive;
     rdp_info("session active for %s", _address.UTF8String);
 
-    /* Advertise a client-side system cursor so the pointer is smooth (decoupled
-     * from the video frame rate). */
+    /* Advertise a client-side system cursor first so the very first pointer the
+     * client gets is valid (and the cursor is smooth, decoupled from the video
+     * frame rate) before the real shapes start streaming. */
     rdp_peer_send_default_cursor(_peer);
+
+    /* Stream the REAL Mac cursor shapes (I-beam, resize, hand, …) as RDP
+     * color-pointer PDUs, so mstsc renders the correct shape client-side,
+     * lag-free. Capture runs with showsCursor=NO, so this is the ONLY cursor
+     * the client sees — no double-cursor, no compositing lag. */
+    _cursor = [[CursorCapture alloc] init];
+    _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
+                        uint16_t hotX, uint16_t hotY) {
+        rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
+    };
+    [_cursor start];
 }
 
 - (void)disconnect {
@@ -233,6 +247,7 @@ static void rdp_on_keyframe_request(void *ud) {
 
 - (void)teardown {
     rdp_verbose("tearing down session for %s", _address.UTF8String);
+    [_cursor stop];
     [_capture stop];
     [_encoder stop];
     [_audio stop];

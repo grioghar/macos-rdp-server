@@ -110,3 +110,18 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
 /* Tell the client to render the default system pointer CLIENT-SIDE, so the cursor
  * tracks the local mouse smoothly instead of being tied to the (30fps) video. */
 void rdp_peer_send_default_cursor(freerdp_peer *peer);
+
+/* Send the ACTUAL current cursor shape as an RDP color-pointer PDU so mstsc
+ * renders the correct shape (I-beam, resize, hand, …) client-side, lag-free.
+ *
+ * `bgra` is a 32-bit BGRA premultiplied, TOP-LEFT-origin, tightly packed
+ * (stride == w*4) bitmap; w/h are in pixels (capped ~96; >96 uses the Large
+ * pointer PDU). hotX/hotY are the hotspot in bitmap pixels. Internally builds a
+ * bottom-up xor mask + a 1bpp AND mask from the alpha channel.
+ *
+ * Holds xportLock (transport write). No-op if the peer is not yet activated or
+ * output is suppressed. Safe to call repeatedly; the caller should de-dupe
+ * (only call when the shape actually changes). */
+void rdp_peer_send_cursor_shape(freerdp_peer *peer,
+                                const uint8_t *bgra, uint32_t w, uint32_t h,
+                                uint16_t hotX, uint16_t hotY);

@@ -32,6 +32,7 @@
  * heartbeat can re-feed it after SCStream goes idle on a static screen. */
 @property (nonatomic, assign) IOSurfaceRef lastSurface;
 @property (nonatomic, strong) dispatch_source_t heartbeat;
+@property (nonatomic, assign) uint64_t lastHeartbeatFrameCount;
 @end
 
 @implementation ScreenCapture
@@ -95,7 +96,7 @@
         cfg.width                = width;
         cfg.height               = height;
         cfg.pixelFormat          = kCVPixelFormatType_32BGRA;
-        cfg.minimumFrameInterval = CMTimeMake(1, 60);   /* up to 60 fps */
+        cfg.minimumFrameInterval = CMTimeMake(1, 30);   /* cap ~30 fps (RDP-sane) */
         cfg.queueDepth           = 5;
         cfg.showsCursor          = YES;
 
@@ -125,10 +126,18 @@
         dispatch_source_t hb = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER,
                                                       0, 0, self_.captureQueue);
         dispatch_source_set_timer(hb, dispatch_time(DISPATCH_TIME_NOW, 0),
-                                  (uint64_t)(NSEC_PER_SEC / 20), NSEC_PER_SEC / 60);
+                                  (uint64_t)(NSEC_PER_SEC / 4), NSEC_PER_SEC / 8);
         dispatch_source_set_event_handler(hb, ^{
             typeof(self) s2 = weak;
             if (!s2 || !s2.capturing) return;
+            /* Coalesce with SCStream: if it delivered a frame since the last tick the
+             * stream is active, so skip — otherwise we'd double the frame rate and
+             * flood the client (which dropped us with an "invalid format" decode error
+             * under ~110fps). The heartbeat only re-feeds when the screen is idle. */
+            if (s2.frameCount != s2.lastHeartbeatFrameCount) {
+                s2.lastHeartbeatFrameCount = s2.frameCount;
+                return;
+            }
             IOSurfaceRef surf = s2.lastSurface;
             ScreenCaptureFrameBlock handler = s2.frameHandler;
             if (surf && handler)

@@ -206,7 +206,8 @@ static void rdp_on_keyframe_request(void *ud) {
     if (clientWantsAudio) {
         _audio = [[AudioCapture alloc] init];
         _audio.captureBlock = ^(const int16_t *samples, uint32_t frameCount) {
-            rdp_debug("audio: %u frames", frameCount);
+            /* No per-buffer logging here: buffers arrive ~100x/sec and flooded the
+             * log. AudioCapture itself logs a throttled frame total. */
             rdp_peer_send_audio(weak.peer, samples, frameCount);
         };
         NSError *audioErr = nil;

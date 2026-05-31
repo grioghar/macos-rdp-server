@@ -101,8 +101,17 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
                                msg:"CATapDescription alloc failed"];
     }
     desc.privateTap   = YES;
-    desc.muteBehavior = CATapUnmuted;
+    /* Audio routing switch (RDP_AUDIO_LOCAL): "1"/unset (default) = CATapUnmuted,
+     * so the desk user STILL hears audio locally while it also streams to the
+     * remote client (audio in BOTH places). "0" = CATapMuted, so the tapped audio
+     * is silenced on the Mac's speakers and only the remote client hears it
+     * (e.g. for privacy / not disturbing people near the Mac). A GUI toggle writes
+     * this env var into the LaunchAgent. */
+    const char *localAudio = getenv("RDP_AUDIO_LOCAL");
+    BOOL playLocally = !(localAudio && strcmp(localAudio, "0") == 0);
+    desc.muteBehavior = playLocally ? CATapUnmuted : CATapMuted;
     desc.name         = @"macos-rdp system audio tap";
+    rdp_info("audio routing: %s", playLocally ? "both (Mac + remote)" : "remote only (Mac muted)");
 
     /* 2. Create the process tap. */
     AudioObjectID tap = kAudioObjectUnknown;

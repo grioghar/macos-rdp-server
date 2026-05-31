@@ -1,4 +1,5 @@
 #import "daemon/RDPSession.h"
+#import "daemon/DisplayControl.h"
 #import "protocol/RDPPeer.h"
 #import "display/VirtualDisplay.h"
 #import "display/ScreenCapture.h"
@@ -22,6 +23,7 @@ static const uint32_t kDefaultBitrate = 8000;
 @property (nonatomic, strong) NSString *address;
 @property (nonatomic, assign) freerdp_peer *peer;
 @property (nonatomic, strong) VirtualDisplay  *display;
+@property (nonatomic, strong) DisplayControl  *displayControl;
 @property (nonatomic, strong) ScreenCapture   *capture;
 @property (nonatomic, strong) FrameEncoder    *encoder;
 @property (nonatomic, strong) InputInjector   *injector;
@@ -147,6 +149,13 @@ static void rdp_on_keyframe_request(void *ud) {
 
     CGDirectDisplayID displayID = _display ? _display.displayID : CGMainDisplayID();
 
+    /* Wake the Mac + keep it awake for the whole session (replaces caffeinate),
+     * and privacy-blank the BUILT-IN display so a bystander can't watch the
+     * remote session. Pass the virtual display id so we never blank the screen
+     * the remote actually captures. RDP_SHARED_MODE=1 skips blanking. */
+    _displayControl = [[DisplayControl alloc] initWithVirtualDisplayID:displayID];
+    [_displayControl start];
+
     _encoder = [[FrameEncoder alloc] initWithWidth:width height:height
                                            bitrate:kDefaultBitrate];
     __weak typeof(self) weak = self;
@@ -228,6 +237,7 @@ static void rdp_on_keyframe_request(void *ud) {
     [_encoder stop];
     [_audio stop];
     [_clipboard stop];
+    [_displayControl stop];
     [_display destroy];
 
     if (_peer) { rdp_peer_destroy(_peer); _peer = NULL; }

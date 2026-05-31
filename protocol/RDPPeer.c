@@ -215,6 +215,13 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     gfx->MapSurfaceToOutput(gfx, &ms);
 
     ctx->gfxReady = true;
+    /* Any frames encoded during GFX setup were dropped ("gfx not ready"), so demand
+     * a fresh IDR — the first frame the client decodes must be a keyframe. */
+    ctx->sentKeyframe = false;
+    if (ctx->callbacks.onKeyframeRequest) {
+        ctx->keyframeRequested = true;
+        ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
+    }
     rdp_info("GFX pipeline ready (%ux%u AVC420)", w, h);
     return CHANNEL_RC_OK;
 }
@@ -520,6 +527,20 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
                                uint16_t dirtyW, uint16_t dirtyH) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->gfxReady || !ctx->gfx) { rdp_debug("gfx not ready"); return false; }
+
+    /* The first frame the client receives MUST be a self-contained keyframe.
+     * Frames encoded while the GFX channel was still opening were discarded, so a
+     * delta sent now references frames the client never got -> undecodable (black).
+     * Drop deltas until a keyframe goes out, asking the encoder to emit one. */
+    if (!ctx->sentKeyframe && !isKeyFrame) {
+        if (!ctx->keyframeRequested && ctx->callbacks.onKeyframeRequest) {
+            ctx->keyframeRequested = true;
+            ctx->callbacks.onKeyframeRequest(ctx->callbacks.userdata);
+            rdp_debug("delta before first keyframe — requested IDR, dropping");
+        }
+        return true;
+    }
+    if (isKeyFrame) { ctx->sentKeyframe = true; ctx->keyframeRequested = false; }
 
     /* Build the damage region. Keyframes refresh the whole surface, so they
      * must claim the full extent; inter-frames claim only the dirty rect.

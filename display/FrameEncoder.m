@@ -16,6 +16,7 @@
  * serially on one callback thread, so a single buffer reset per frame
  * avoids a heap allocation + grow on every frame (60/sec). */
 @property (nonatomic, strong) NSMutableData *annexBuffer;
+@property (nonatomic, assign) BOOL forceNextKeyframe;
 @end
 
 static void vt_callback(void *outputCallbackRefCon, void *sourceFrameRefCon,
@@ -93,9 +94,25 @@ static inline void unpack_rect(void *refcon, uint16_t *x, uint16_t *y,
     }
     CMTime pts = CMTimeMake(_frameIndex++, 60);
     void *refcon = pack_rect(dirtyX, dirtyY, dirtyW, dirtyH);
+
+    /* Force an IDR when requested (e.g. first frame after the GFX channel opens). */
+    CFDictionaryRef frameProps = NULL;
+    if (_forceNextKeyframe) {
+        _forceNextKeyframe = NO;
+        const void *k = kVTEncodeFrameOptionKey_ForceKeyFrame;
+        const void *v = kCFBooleanTrue;
+        frameProps = CFDictionaryCreate(NULL, &k, &v, 1,
+                                        &kCFTypeDictionaryKeyCallBacks,
+                                        &kCFTypeDictionaryValueCallBacks);
+    }
     VTCompressionSessionEncodeFrame(_session, pixbuf, pts, kCMTimeInvalid,
-                                    NULL, refcon, NULL);
+                                    frameProps, refcon, NULL);
+    if (frameProps) CFRelease(frameProps);
     CVPixelBufferRelease(pixbuf);
+}
+
+- (void)forceKeyframe {
+    _forceNextKeyframe = YES;
 }
 
 - (void)stop {

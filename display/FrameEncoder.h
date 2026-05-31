@@ -25,6 +25,11 @@ typedef void (^FrameEncoderOutputBlock)(const uint8_t *data, size_t len,
 - (void)encodeFrame:(IOSurfaceRef)surface
              dirtyX:(uint16_t)dirtyX dirtyY:(uint16_t)dirtyY
              dirtyW:(uint16_t)dirtyW dirtyH:(uint16_t)dirtyH;
+/* Force the next encoded frame to be an IDR keyframe. Used when the GFX channel
+ * becomes ready: any frames encoded before that point were discarded (not sent),
+ * so the first frame the client receives must be a self-contained keyframe — a
+ * P-frame referencing never-sent frames is undecodable and renders black. */
+- (void)forceKeyframe;
 - (void)stop;
 
 @end

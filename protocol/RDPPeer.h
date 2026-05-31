@@ -17,6 +17,7 @@ typedef void (*RDPPeerInputCallback)(void *userdata, uint16_t flags, uint16_t co
 typedef void (*RDPPeerMouseCallback)(void *userdata, uint16_t flags, uint16_t x, uint16_t y);
 typedef void (*RDPPeerClipboardCallback)(void *userdata, const uint8_t *data, size_t len, uint32_t format);
 typedef void (*RDPPeerReadyCallback)(void *userdata, uint32_t width, uint32_t height, uint32_t colorDepth);
+typedef void (*RDPPeerKeyframeCallback)(void *userdata);
 
 typedef struct {
     RDPPeerInputCallback     onKeyboard;
@@ -24,6 +25,10 @@ typedef struct {
     RDPPeerMouseCallback     onMouseEx;
     RDPPeerClipboardCallback onClipboard;
     RDPPeerReadyCallback     onReady;
+    /* Asks the encoder to emit an IDR keyframe ASAP. Invoked when the GFX channel
+     * becomes ready (frames encoded earlier were discarded, so the first sent
+     * frame must be a keyframe) or when a delta arrives before any keyframe. */
+    RDPPeerKeyframeCallback  onKeyframeRequest;
     void *userdata;
 } RDPPeerCallbacks;
 
@@ -42,6 +47,8 @@ struct rdp_peer_context {
     pthread_mutex_t      gfxLock;
     bool                 gfxOpened;  /* GFX DVC Open() succeeded (drdynvc ready) */
     bool                 gfxReady;   /* client sent GFX caps; surface mapped */
+    bool                 sentKeyframe;     /* a keyframe has been sent this session */
+    bool                 keyframeRequested;/* debounce: requested an IDR, awaiting it */
     bool                 activated;
     bool                 audioReady; /* set by rdpsnd Activated callback */
     /* Clipboard: the host's current data, advertised via Format List and held

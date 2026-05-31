@@ -60,6 +60,7 @@ static const uint32_t kDefaultBitrate = 8000;
         .onMouseEx   = rdp_on_mouse_ex,
         .onClipboard = rdp_on_clipboard,
         .onReady     = rdp_on_ready,
+        .onKeyframeRequest = rdp_on_keyframe_request,
         .userdata    = (__bridge void *)self,
     };
 
@@ -122,6 +123,12 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
     RDPSession *self = (__bridge RDPSession *)ud;
     rdp_verbose("clipboard from client: format=0x%08x len=%zu", format, len);
     [self.clipboard receiveFromClient:data length:len format:format];
+}
+
+static void rdp_on_keyframe_request(void *ud) {
+    RDPSession *self = (__bridge RDPSession *)ud;
+    rdp_debug("keyframe requested by peer");
+    [self.encoder forceKeyframe];
 }
 
 - (void)setupDisplayAndMediaForWidth:(uint32_t)w height:(uint32_t)h {

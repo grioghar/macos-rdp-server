@@ -11,8 +11,15 @@
 @property (nonatomic, assign) BOOL created;
 
 #if MACOS_RDP_VIRTUAL_DISPLAY
-/* Opaque pointer so the compiler doesn't need CGVirtualDisplay headers here. */
+/* Opaque pointers so the compiler doesn't need CGVirtualDisplay headers here.
+ * CGVirtualDisplay and its private VirtualDisplayListener thread keep using the
+ * descriptor/mode/settings objects AFTER applySettings: returns, so all of them
+ * must be retained for the display's whole lifetime — otherwise they dealloc when
+ * createVirtualDisplay returns and the listener thread crashes on freed memory. */
 @property (nonatomic, strong) id vdObject;
+@property (nonatomic, strong) id vdDescriptor;
+@property (nonatomic, strong) id vdMode;
+@property (nonatomic, strong) id vdSettings;
 #endif
 @end
 
@@ -51,7 +58,12 @@
 - (void)destroy {
     if (!_created) return;
 #if MACOS_RDP_VIRTUAL_DISPLAY
-    _vdObject = nil;
+    /* Release in reverse dependency order: drop the display first (stops its
+     * listener thread), then the settings/mode/descriptor it referenced. */
+    _vdObject     = nil;
+    _vdSettings   = nil;
+    _vdMode       = nil;
+    _vdDescriptor = nil;
 #endif
     _did = 0;
     _created = NO;
@@ -108,7 +120,14 @@
         if (!vd) { rdp_error("CGVirtualDisplay init failed — main display"); return; }
 
         /* Build a mode via NSInvocation (scalar args). Signature is assumed
-         * (unsigned int width, unsigned int height, double refreshRate). */
+         * (unsigned int width, unsigned int height, double refreshRate).
+         *
+         * initWithWidth:... is an init-family method: it initialises the alloc'd
+         * receiver in place and returns self. We deliberately use the alloc'd
+         * object `m` directly rather than reading getReturnValue + __bridge — that
+         * earlier pattern gave ARC two independent strong references (m and the
+         * bridged return) to one +1 object and over-released it (SIGSEGV in
+         * objc_release). With a single strong `m`, ARC owns exactly one +1. */
         id mode = nil;
         SEL modeSel = @selector(initWithWidth:height:refreshRate:);
         if ([modeClass instancesRespondToSelector:modeSel]) {
@@ -120,9 +139,8 @@
             [inv setArgument:&w atIndex:2];
             [inv setArgument:&h atIndex:3];
             [inv setArgument:&rr atIndex:4];
-            [inv invoke];
-            void *ret = NULL; [inv getReturnValue:&ret];
-            mode = (__bridge id)ret;
+            [inv invoke];                 /* initialises m in place, returns self */
+            mode = m;
         }
         if (!mode) { rdp_error("CGVirtualDisplayMode init failed — main display"); return; }
 
@@ -137,6 +155,7 @@
             NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:sig2];
             inv2.target = vd; inv2.selector = applySel;
             [inv2 setArgument:&settings atIndex:2];
+            [inv2 retainArguments];   /* NSInvocation won't outlive `settings` otherwise */
             [inv2 invoke];
             [inv2 getReturnValue:&applied];
         }
@@ -145,7 +164,14 @@
         @try { vdid = (CGDirectDisplayID)[[vd valueForKey:@"displayID"] unsignedIntValue]; }
         @catch (id e) {}
         if (vdid != 0) {
-            _vdObject = vd;
+            /* Retain ALL of these for the display's lifetime — CGVirtualDisplay and
+             * its listener thread reference the descriptor (and its queue), the mode,
+             * and the settings after this function returns. Letting them dealloc here
+             * was a use-after-free that crashed the daemon mid-session. */
+            _vdObject     = vd;
+            _vdDescriptor = desc;
+            _vdMode       = mode;
+            _vdSettings   = settings;
             _did = vdid;
             rdp_info("virtual display created: displayID=%u %ux%u (applied=%d)",
                      _did, _w, _h, applied);

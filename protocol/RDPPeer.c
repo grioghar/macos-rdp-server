@@ -609,6 +609,20 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     return true;
 }
 
+void rdp_peer_send_default_cursor(freerdp_peer *peer) {
+    /* Without any pointer update, mstsc renders the cursor coupled to frame
+     * redraws (jerky). Advertising the default SYSTEM pointer makes the client
+     * draw + move the cursor locally at the mouse's native rate (smooth), like a
+     * Windows RDP server. (Showing the actual Mac cursor shapes lag-free would
+     * need full color-pointer PDUs built from the captured cursor — a follow-up.) */
+    rdpPointerUpdate *pointer = peer->context->update->pointer;
+    if (!pointer || !pointer->PointerSystem) return;
+    POINTER_SYSTEM_UPDATE sys = {0};
+    sys.type = SYSPTR_DEFAULT;
+    pointer->PointerSystem(peer->context, &sys);
+    rdp_verbose("sent default system pointer (client-side cursor)");
+}
+
 bool rdp_peer_send_bitmap(freerdp_peer *peer,
                            const uint8_t *bgra, uint32_t x, uint32_t y,
                            uint32_t width, uint32_t height) {

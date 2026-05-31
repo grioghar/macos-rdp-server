@@ -211,6 +211,10 @@ static void rdp_on_keyframe_request(void *ud) {
 
     _sessionState = RDPSessionStateActive;
     rdp_info("session active for %s", _address.UTF8String);
+
+    /* Advertise a client-side system cursor so the pointer is smooth (decoupled
+     * from the video frame rate). */
+    rdp_peer_send_default_cursor(_peer);
 }
 
 - (void)disconnect {

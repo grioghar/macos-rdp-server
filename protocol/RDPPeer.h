@@ -95,3 +95,7 @@ bool rdp_peer_send_audio(freerdp_peer *peer,
 bool rdp_peer_send_clipboard(freerdp_peer *peer,
                               const uint8_t *data, size_t len,
                               uint32_t format);
+
+/* Tell the client to render the default system pointer CLIENT-SIDE, so the cursor
+ * tracks the local mouse smoothly instead of being tied to the (30fps) video. */
+void rdp_peer_send_default_cursor(freerdp_peer *peer);

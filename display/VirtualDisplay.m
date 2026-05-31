@@ -65,42 +65,92 @@
 #if MACOS_RDP_VIRTUAL_DISPLAY
 - (void)createVirtualDisplay {
     /*
-     * CGVirtualDisplay requires com.apple.developer.virtual-display entitlement.
-     * Compile with -DMACOS_RDP_VIRTUAL_DISPLAY=1 and sign with that entitlement.
-     *
-     * Uses NSClassFromString to avoid a hard link against the symbols so the
-     * binary still launches without the entitlement (it just falls back above).
+     * Create a CGVirtualDisplay sized exactly to the RDP client (e.g. 3440x1440)
+     * so there is no pillarbox/scaling and pointer mapping is 1:1. CGVirtualDisplay
+     * is a PRIVATE CoreGraphics API (CGVirtualDisplayDescriptor / *Mode / *Settings),
+     * driven here entirely via NSClassFromString + KVC + NSInvocation so a missing
+     * class / wrong ABI / thrown exception cleanly falls back to the main display
+     * (pillarboxed) instead of crashing the daemon.
      */
-    Class descClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
-    Class dispClass = NSClassFromString(@"CGVirtualDisplay");
-    if (!descClass || !dispClass) {
-        rdp_verbose("CGVirtualDisplay not available (entitlement missing?), "
-                    "falling back to main display");
-        _did = CGMainDisplayID();
-        return;
-    }
+    _did = CGMainDisplayID();   /* safe default */
+    @try {
+        Class descClass = NSClassFromString(@"CGVirtualDisplayDescriptor");
+        Class dispClass = NSClassFromString(@"CGVirtualDisplay");
+        Class modeClass = NSClassFromString(@"CGVirtualDisplayMode");
+        Class setClass  = NSClassFromString(@"CGVirtualDisplaySettings");
+        if (!descClass || !dispClass || !modeClass || !setClass) {
+            rdp_error("CGVirtualDisplay classes unavailable on this macOS — "
+                      "using main display (pillarboxed)");
+            return;
+        }
 
-    id desc = [[descClass alloc] init];
-    [desc setValue:@"RDP Virtual Display"    forKey:@"name"];
-    [desc setValue:@(_w)                     forKey:@"width"];
-    [desc setValue:@(_h)                     forKey:@"height"];
-    [desc setValue:@NO                       forKey:@"hiDPI"];
-    double dpi = 96.0;
-    CGSize mm = CGSizeMake((_w / dpi) * 25.4, (_h / dpi) * 25.4);
-    [desc setValue:[NSValue valueWithBytes:&mm objCType:@encode(CGSize)]
-            forKey:@"sizeInMillimeters"];
-    [desc setValue:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0)
-            forKey:@"queue"];
+        id desc = [[descClass alloc] init];
+        [desc setValue:@"RDP Virtual Display" forKey:@"name"];
+        [desc setValue:@(_w) forKey:@"maxPixelsWide"];
+        [desc setValue:@(_h) forKey:@"maxPixelsHigh"];
+        double dpi = 100.0;
+        CGSize mm = CGSizeMake((_w / dpi) * 25.4, (_h / dpi) * 25.4);
+        [desc setValue:[NSValue valueWithBytes:&mm objCType:@encode(CGSize)]
+                forKey:@"sizeInMillimeters"];
+        @try { [desc setValue:@(0x5244500u) forKey:@"productID"]; } @catch (id e) {}
+        @try { [desc setValue:@(0x5244500u) forKey:@"vendorID"];  } @catch (id e) {}
+        @try { [desc setValue:@(1)          forKey:@"serialNum"]; } @catch (id e) {}
+        @try { [desc setValue:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0)
+                       forKey:@"queue"]; } @catch (id e) {}
 
-    id vd = [[dispClass alloc] initWithDescriptor:desc];
-    if (!vd) {
-        rdp_error("CGVirtualDisplay alloc failed, using main display");
+        id vd = [[dispClass alloc] initWithDescriptor:desc];
+        if (!vd) { rdp_error("CGVirtualDisplay init failed — main display"); return; }
+
+        /* Build a mode via NSInvocation (scalar args). Signature is assumed
+         * (unsigned int width, unsigned int height, double refreshRate). */
+        id mode = nil;
+        SEL modeSel = @selector(initWithWidth:height:refreshRate:);
+        if ([modeClass instancesRespondToSelector:modeSel]) {
+            id m = [modeClass alloc];
+            NSMethodSignature *sig = [m methodSignatureForSelector:modeSel];
+            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+            inv.target = m; inv.selector = modeSel;
+            unsigned int w = _w, h = _h; double rr = 60.0;
+            [inv setArgument:&w atIndex:2];
+            [inv setArgument:&h atIndex:3];
+            [inv setArgument:&rr atIndex:4];
+            [inv invoke];
+            void *ret = NULL; [inv getReturnValue:&ret];
+            mode = (__bridge id)ret;
+        }
+        if (!mode) { rdp_error("CGVirtualDisplayMode init failed — main display"); return; }
+
+        id settings = [[setClass alloc] init];
+        [settings setValue:@[mode] forKey:@"modes"];
+        @try { [settings setValue:@(0) forKey:@"hiDPI"]; } @catch (id e) {}
+
+        BOOL applied = NO;
+        SEL applySel = @selector(applySettings:);
+        if ([vd respondsToSelector:applySel]) {
+            NSMethodSignature *sig2 = [vd methodSignatureForSelector:applySel];
+            NSInvocation *inv2 = [NSInvocation invocationWithMethodSignature:sig2];
+            inv2.target = vd; inv2.selector = applySel;
+            [inv2 setArgument:&settings atIndex:2];
+            [inv2 invoke];
+            [inv2 getReturnValue:&applied];
+        }
+
+        CGDirectDisplayID vdid = 0;
+        @try { vdid = (CGDirectDisplayID)[[vd valueForKey:@"displayID"] unsignedIntValue]; }
+        @catch (id e) {}
+        if (vdid != 0) {
+            _vdObject = vd;
+            _did = vdid;
+            rdp_info("virtual display created: displayID=%u %ux%u (applied=%d)",
+                     _did, _w, _h, applied);
+        } else {
+            rdp_error("virtual display has no displayID — main display");
+        }
+    } @catch (NSException *e) {
+        rdp_error("virtual display creation threw (%s) — main display",
+                  e.reason.UTF8String ?: "?");
         _did = CGMainDisplayID();
-        return;
     }
-    _vdObject = vd;
-    _did = (CGDirectDisplayID)[[vd valueForKey:@"displayID"] unsignedIntValue];
-    rdp_info("virtual display created: displayID=%u %ux%u", _did, _w, _h);
 }
 #endif
 

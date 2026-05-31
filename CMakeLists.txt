@@ -106,8 +106,11 @@ target_compile_options(macos-rdp-daemon PRIVATE
 # Link-time optimisation — dead-strips unused code across translation units.
 set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
+# MACOS_RDP_VIRTUAL_DISPLAY: create a CGVirtualDisplay sized to the RDP client
+# (no pillarbox / 1:1 input). Falls back to the main display if the private API fails.
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.6"
+    MACOS_RDP_VIRTUAL_DISPLAY=1
 )
 
 # ── Install ───────────────────────────────────────────────────────────────

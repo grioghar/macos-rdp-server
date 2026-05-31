@@ -160,14 +160,19 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     for (UINT16 i = 0; i < pdu->capsSetCount; i++) {
         rdp_debug("  caps[%u] version=0x%08x flags=0x%08x",
                   i, pdu->capsSets[i].version, pdu->capsSets[i].flags);
-        if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_8) {
-            /* Echo the advertised capset back VERBATIM — version, length AND flags.
-             * mstsc validates that the confirmed caps exactly match one it offered;
-             * we previously left capset.length = 0, so mstsc rejected CapsConfirm
-             * (its log: GfxEventConfirmCapsFailed / 0x8007000D E_INVALIDARG),
-             * errored the GFX channel, and disconnected — the desktop stayed black. */
+        /* Pick the HIGHEST advertised version >= v8 and echo it back VERBATIM
+         * (version, length AND flags). Two mstsc requirements learned the hard way
+         * from its client event log:
+         *   1. The confirmed capset must EXACTLY match one advertised — leaving
+         *      length=0 got CapsConfirm rejected (GfxEventConfirmCapsFailed /
+         *      0x8007000D), so we copy the whole struct verbatim.
+         *   2. Confirming the LOWEST version (v8, flags=0) leaves "AVC available: 0"
+         *      and mstsc cannot decode our AVC420 frames (GfxEventDecodingW2S1PduFailed
+         *      / 0x8000FFFF). v8.1 / v10.x enable AVC420 by default, so pick the
+         *      highest version the client offered. */
+        if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_8 &&
+            pdu->capsSets[i].version >= capset.version) {
             capset = pdu->capsSets[i];
-            break;
         }
     }
     if (!capset.version) {

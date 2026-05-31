@@ -161,8 +161,12 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
         rdp_debug("  caps[%u] version=0x%08x flags=0x%08x",
                   i, pdu->capsSets[i].version, pdu->capsSets[i].flags);
         if (pdu->capsSets[i].version >= RDPGFX_CAPVERSION_8) {
-            capset.version = pdu->capsSets[i].version;
-            capset.flags   = pdu->capsSets[i].flags;
+            /* Echo the advertised capset back VERBATIM — version, length AND flags.
+             * mstsc validates that the confirmed caps exactly match one it offered;
+             * we previously left capset.length = 0, so mstsc rejected CapsConfirm
+             * (its log: GfxEventConfirmCapsFailed / 0x8007000D E_INVALIDARG),
+             * errored the GFX channel, and disconnected — the desktop stayed black. */
+            capset = pdu->capsSets[i];
             break;
         }
     }

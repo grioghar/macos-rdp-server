@@ -28,6 +28,15 @@
     if (_capturing) return YES;
     rdp_verbose("starting CGDisplayStream on displayID=%u %ux%u", _displayID, width, height);
 
+    /* Ensure Screen Recording is granted. In the user's GUI session this pops the
+     * system prompt the first time and registers the binary in the Privacy list,
+     * so the user can grant with one click instead of hunting in System Settings. */
+    if (!CGPreflightScreenCaptureAccess()) {
+        rdp_error("Screen Recording not granted — requesting access (grant the prompt, "
+                  "or System Settings > Privacy & Security > Screen Recording, then reconnect)");
+        CGRequestScreenCaptureAccess();
+    }
+
     NSDictionary *opts = @{
         (__bridge NSString *)kCGDisplayStreamPreserveAspectRatio: @NO,
         (__bridge NSString *)kCGDisplayStreamMinimumFrameTime:    @(1.0/60.0),

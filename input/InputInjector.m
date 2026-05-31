@@ -1,6 +1,9 @@
 #import "input/InputInjector.h"
 #import <AppKit/AppKit.h>
+#import <ApplicationServices/ApplicationServices.h>
 #import <syslog.h>
+#define RDP_LOG_COMPONENT "input"
+#include "logging/RDPLog.h"
 
 /* RDP scan code → macOS virtual key code mapping (subset, covering common keys).
    Full table follows USB HID Usage Tables §10 and Mac OS X keycodes. */
@@ -83,6 +86,14 @@ static const uint16_t kExtScanToVK[256] = {
 - (instancetype)initWithDisplayID:(CGDirectDisplayID)did {
     if ((self = [super init])) {
         _displayID = did;
+        /* Prompt for Accessibility (required for CGEventPost) and register the
+         * binary in the Privacy list. In the GUI session this pops the system
+         * dialog the first time; thereafter it just reports the trust state. */
+        NSDictionary *opts = @{ (__bridge id)kAXTrustedCheckOptionPrompt: @YES };
+        if (!AXIsProcessTrustedWithOptions((__bridge CFDictionaryRef)opts))
+            rdp_error("Accessibility not granted — input injection will not work "
+                      "until enabled (grant the prompt or System Settings > Privacy "
+                      "& Security > Accessibility)");
     }
     return self;
 }

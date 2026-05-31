@@ -165,8 +165,11 @@ static void rdp_on_clipboard(void *ud, const uint8_t *data, size_t len,
         rdp_debug("captured frame: dirty=(%u,%u,%ux%u)", dx, dy, dw, dh);
         [weak.encoder encodeFrame:surface dirtyX:dx dirtyY:dy dirtyW:dw dirtyH:dh];
     };
-    [_capture startWithWidth:width height:height];
-    rdp_verbose("screen capture started on displayID=%u", displayID);
+    if ([_capture startWithWidth:width height:height])
+        rdp_verbose("screen capture started on displayID=%u", displayID);
+    else
+        rdp_error("screen capture FAILED on displayID=%u — desktop will be black "
+                  "until Screen Recording is granted", displayID);
 
     _injector  = [[InputInjector alloc] initWithDisplayID:displayID];
     _clipboard = [[ClipboardSync alloc] init];

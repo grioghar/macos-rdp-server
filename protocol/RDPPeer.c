@@ -229,24 +229,62 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
 
 /* ── Clipboard callbacks ───────────────────────────────────────────────── */
 
+/* Windows copied something: the client advertises the formats it now holds. We
+ * must (a) ACK the list, then (b) PULL the bytes we care about by sending a Format
+ * Data Request — the client never pushes data unsolicited. We only consume text,
+ * so pick CF_UNICODETEXT (preferred, lossless UTF-16) and fall back to CF_TEXT. */
 static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_LIST *list) {
+    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
     rdp_verbose("clipboard: client advertised %u formats", list->numFormats);
+
+    /* Acknowledge the advertisement first (msgType is set by the server serializer,
+     * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
     CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};
+    resp.common.msgType  = CB_FORMAT_LIST_RESPONSE;
     resp.common.msgFlags = CB_RESPONSE_OK;
     cliprdr->ServerFormatListResponse(cliprdr, &resp);
+
+    /* Choose the best text format the client offers. */
+    UINT32 want = 0;
+    for (UINT32 i = 0; i < list->numFormats; i++) {
+        UINT32 id = list->formats[i].formatId;
+        if (id == CF_UNICODETEXT) { want = CF_UNICODETEXT; break; }
+        if (id == CF_TEXT)        { want = CF_TEXT; }
+    }
+    if (!want) {
+        rdp_verbose("clipboard: client offered no text format — ignoring");
+        return CHANNEL_RC_OK;
+    }
+
+    /* Request the bytes. The response (cliprdr_client_format_data) has no format
+     * id of its own, so stash what we asked for. */
+    ctx->clipReqFormat = want;
+    CLIPRDR_FORMAT_DATA_REQUEST dreq = {0};
+    dreq.common.msgType   = CB_FORMAT_DATA_REQUEST;
+    dreq.requestedFormatId = want;
+    rdp_verbose("clipboard: requesting format 0x%08x from client", want);
+    cliprdr->ServerFormatDataRequest(cliprdr, &dreq);
     return CHANNEL_RC_OK;
 }
 
+/* The client answered our Format Data Request: hand the bytes to the Mac
+ * pasteboard via the onClipboard callback. The response carries no format id, so
+ * we use the one we requested (clipReqFormat). */
 static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_DATA_RESPONSE *resp) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
     if ((resp->common.msgFlags & CB_RESPONSE_OK) && ctx->callbacks.onClipboard) {
-        rdp_verbose("clipboard: %u bytes from client", resp->common.dataLen);
+        rdp_verbose("clipboard: %u bytes from client (format 0x%08x)",
+                    resp->common.dataLen, ctx->clipReqFormat);
         ctx->callbacks.onClipboard(ctx->callbacks.userdata,
                                    resp->requestedFormatData,
                                    resp->common.dataLen,
-                                   CF_UNICODETEXT);
+                                   ctx->clipReqFormat ? ctx->clipReqFormat
+                                                      : (UINT32)CF_UNICODETEXT);
+    } else {
+        rdp_verbose("clipboard: client format-data response failed (flags=0x%04x)",
+                    resp->common.msgFlags);
     }
     return CHANNEL_RC_OK;
 }
@@ -259,7 +297,8 @@ static UINT cliprdr_client_format_data_request(
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
     CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
 
-    if (ctx->clipData && ctx->clipLen > 0) {
+    if (ctx->clipData && ctx->clipLen > 0 &&
+        req->requestedFormatId == ctx->clipFormat) {
         resp.common.msgFlags     = CB_RESPONSE_OK;
         resp.common.dataLen      = (UINT32)ctx->clipLen;
         resp.requestedFormatData = (BYTE *)ctx->clipData;
@@ -267,7 +306,9 @@ static UINT cliprdr_client_format_data_request(
                     ctx->clipLen, req->requestedFormatId);
     } else {
         resp.common.msgFlags = CB_RESPONSE_FAIL;
-        rdp_verbose("clipboard: data request but nothing held");
+        rdp_verbose("clipboard: data request 0x%08x but nothing matching held "
+                    "(have format 0x%08x, %zu bytes)",
+                    req->requestedFormatId, ctx->clipFormat, ctx->clipLen);
     }
     cliprdr->ServerFormatDataResponse(cliprdr, &resp);
     return CHANNEL_RC_OK;
@@ -738,10 +779,17 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     ctx->clipLen    = len;
     ctx->clipFormat = format;
 
-    /* Advertise the available format; the client requests the bytes on paste. */
+    /* Advertise the available format; the client requests the bytes on paste.
+     *
+     * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
+     * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
+     * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
+     * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs). formatName stays NULL:
+     * standard formats (CF_UNICODETEXT etc.) are identified by id alone. */
     CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = NULL };
     CLIPRDR_FORMAT_LIST list = {0};
-    list.common.msgFlags = CB_RESPONSE_OK;
+    list.common.msgType  = CB_FORMAT_LIST;
+    list.common.msgFlags = 0;
     list.numFormats      = 1;
     list.formats         = &fmt;
     /* Called from the clipboard poll thread; serialize against the transport. */

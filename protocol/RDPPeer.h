@@ -64,6 +64,10 @@ struct rdp_peer_context {
     uint8_t             *clipData;
     size_t               clipLen;
     uint32_t             clipFormat;
+    /* The format id we asked the client for via ServerFormatDataRequest after it
+     * advertised a Format List (Win->Mac paste). The matching ClientFormatDataResponse
+     * carries no format id of its own, so we remember what we requested. */
+    uint32_t             clipReqFormat;
 };
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks);

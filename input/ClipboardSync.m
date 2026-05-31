@@ -51,9 +51,16 @@
     if (str) {
         NSData *utf16 = [str dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (utf16) {
+            /* MS-RDPECLIP: CF_UNICODETEXT data is expected to be NUL-terminated.
+             * NSString's encoding does not append one, so add a trailing U+0000.
+             * Unicode/emoji are preserved (surrogate pairs are just more code
+             * units); large blocks are sent in full (no truncation). */
+            NSMutableData *out = [utf16 mutableCopy];
+            const uint16_t nul = 0;
+            [out appendBytes:&nul length:sizeof(nul)];
             rdp_verbose("clipboard: Mac copy -> %zu UTF-16 bytes to client",
-                        (size_t)utf16.length);
-            block((const uint8_t *)utf16.bytes, utf16.length, RDP_CB_FORMAT_UNICODETEXT);
+                        (size_t)out.length);
+            block((const uint8_t *)out.bytes, out.length, RDP_CB_FORMAT_UNICODETEXT);
         }
         return;
     }
@@ -69,13 +76,28 @@
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     [pb clearContents];
     if (format == RDP_CB_FORMAT_UNICODETEXT || format == RDP_CB_FORMAT_TEXT) {
-        NSString *str = [[NSString alloc]
-            initWithData:[NSData dataWithBytes:data length:len]
-                encoding:NSUTF16LittleEndianStringEncoding];
+        NSString *str = nil;
+        if (format == RDP_CB_FORMAT_TEXT) {
+            /* CF_TEXT is ANSI/codepage bytes, NUL-terminated. */
+            str = [[NSString alloc] initWithData:[NSData dataWithBytes:data length:len]
+                                        encoding:NSWindowsCP1252StringEncoding];
+        } else {
+            /* CF_UNICODETEXT is UTF-16LE and mstsc terminates it with a U+0000.
+             * Decoding the trailing NUL yields a stray \0 the Mac pasteboard keeps
+             * verbatim, so trim a single trailing UTF-16 NUL (2 bytes) if present.
+             * Full length is honoured otherwise — no truncation of large blocks. */
+            size_t blen = len;
+            if (blen >= 2 && data[blen - 1] == 0 && data[blen - 2] == 0)
+                blen -= 2;
+            str = [[NSString alloc] initWithData:[NSData dataWithBytes:data length:blen]
+                                        encoding:NSUTF16LittleEndianStringEncoding];
+        }
         if (str) {
             [pb setString:str forType:NSPasteboardTypeString];
             _lastChangeCount = pb.changeCount;  /* don't bounce it back to the client */
             rdp_verbose("clipboard: received %zu bytes from client (text)", len);
+        } else {
+            rdp_verbose("clipboard: failed to decode %zu text bytes from client", len);
         }
     } else if (format == RDP_CB_FORMAT_PNG) {
         [pb setData:[NSData dataWithBytes:data length:len] forType:NSPasteboardTypePNG];

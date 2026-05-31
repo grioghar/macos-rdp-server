@@ -246,15 +246,25 @@ static void rdp_on_keyframe_request(void *ud) {
     rdp_peer_send_default_cursor(_peer);
 
     /* Stream the REAL Mac cursor shapes (I-beam, resize, hand, …) as RDP
-     * color-pointer PDUs, so mstsc renders the correct shape client-side,
-     * lag-free. Capture runs with showsCursor=NO, so this is the ONLY cursor
-     * the client sees — no double-cursor, no compositing lag. */
-    _cursor = [[CursorCapture alloc] init];
-    _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
-                        uint16_t hotX, uint16_t hotY) {
-        rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
-    };
-    [_cursor start];
+     * color-pointer PDUs. OPT-IN via RDP_CURSOR_SHAPES=1 (default OFF): the
+     * current 32bpp color-pointer renders INVISIBLE on mstsc (shapes are captured
+     * and sent at correct sizes, but the client draws nothing — a 32bpp-alpha
+     * color-pointer quirk under investigation). Default keeps the client-side
+     * SYSPTR_DEFAULT arrow above, which is always visible. Re-enable once the
+     * pointer encoding is fixed (likely switch to 24bpp XOR + 1bpp AND mask). */
+    const char *curShapes = getenv("RDP_CURSOR_SHAPES");
+    if (curShapes && strcmp(curShapes, "1") == 0) {
+        _cursor = [[CursorCapture alloc] init];
+        _cursor.handler = ^(const uint8_t *bgra, uint32_t cw, uint32_t ch,
+                            uint16_t hotX, uint16_t hotY) {
+            rdp_peer_send_cursor_shape(weak.peer, bgra, cw, ch, hotX, hotY);
+        };
+        [_cursor start];
+        rdp_info("cursor-shape streaming ON (RDP_CURSOR_SHAPES=1)");
+    } else {
+        rdp_info("cursor-shape streaming OFF (default) — client draws the system "
+                 "arrow; set RDP_CURSOR_SHAPES=1 to stream real Mac cursor shapes");
+    }
 }
 
 - (void)disconnect {

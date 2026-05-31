@@ -1024,9 +1024,16 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
      * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the
      * FreeRDP warning "cliprdr_packet_format_list_new: called with invalid type
      * 00000000". And a Format List is NOT a response — msgFlags must be 0, never
-     * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs). formatName stays NULL:
-     * standard formats (CF_UNICODETEXT etc.) are identified by id alone. */
-    CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = NULL };
+     * CB_RESPONSE_OK (that flag belongs on *_RESPONSE PDUs).
+     *
+     * formatName MUST be a non-NULL (empty) string, NOT NULL. With
+     * useLongFormatNames=TRUE the FreeRDP serializer miscomputes the PDU length for
+     * a NULL name and under-allocates the send stream, then aborts on a
+     * Stream_Write_UINT32 (WinPR assert Stream_GetRemainingCapacity>=4) — a hard
+     * crash that took down the whole daemon mid-clipboard-exchange. An empty ""
+     * yields a 2-byte UTF-16 null terminator and a consistent length. Standard
+     * formats (CF_UNICODETEXT etc.) are still keyed by id alone. */
+    CLIPRDR_FORMAT fmt   = { .formatId = (UINT32)format, .formatName = (char *)"" };
     CLIPRDR_FORMAT_LIST list = {0};
     list.common.msgType  = CB_FORMAT_LIST;
     list.common.msgFlags = 0;

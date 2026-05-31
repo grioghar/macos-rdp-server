@@ -35,6 +35,7 @@ struct rdp_peer_context {
     CliprdrServerContext *cliprdr;
     RdpsndServerContext  *rdpsnd;
     uint32_t             surfaceId;
+    uint32_t             frameId;    /* monotonic GFX frame id for StartFrame/EndFrame */
     /* Serializes ALL access to the GFX context (SurfaceCommand from the encoder
      * thread vs handle_messages from the run-loop thread). The GFX channel is
      * also put in external-thread mode so its internal thread never runs. */

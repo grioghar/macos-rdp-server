@@ -547,11 +547,20 @@ bool rdp_peer_send_h264_frame(freerdp_peer *peer,
     cmd.data      = (BYTE *)data;
     cmd.extra     = &avc;
 
+    /* Wrap the surface command in StartFrame/EndFrame markers, like the shadow
+     * server. mstsc needs the frame boundaries (and frameId) to composite the
+     * decoded surface to the display — bare SurfaceCommands often don't render. */
+    uint32_t fid = ++ctx->frameId;
+    RDPGFX_START_FRAME_PDU startFrame = {0};
+    startFrame.frameId = fid;
+    RDPGFX_END_FRAME_PDU endFrame = {0};
+    endFrame.frameId = fid;
+
     /* Serialize against the run-loop's handle_messages (shared GFX state). */
     pthread_mutex_lock(&ctx->gfxLock);
-    UINT rc = ctx->gfx->SurfaceCommand(ctx->gfx, &cmd);
+    UINT rc = ctx->gfx->SurfaceFrameCommand(ctx->gfx, &cmd, &startFrame, &endFrame);
     pthread_mutex_unlock(&ctx->gfxLock);
-    if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceCommand failed: %u", rc); return false; }
+    if (rc != CHANNEL_RC_OK) { rdp_error("SurfaceFrameCommand failed: %u", rc); return false; }
     rdp_debug("sent %s frame: region=(%u,%u)-(%u,%u) len=%zu",
               isKeyFrame ? "key" : "delta",
               rect.left, rect.top, rect.right, rect.bottom, len);

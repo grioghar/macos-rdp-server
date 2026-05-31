@@ -692,6 +692,111 @@ void rdp_peer_send_default_cursor(freerdp_peer *peer) {
     rdp_verbose("sent default system pointer (client-side cursor)");
 }
 
+/* Cursor cap from CursorCapture (kMaxCursorDim). Anything <= 96px in EITHER
+ * dimension still fits a New (color) pointer, which mstsc renders identically
+ * to a Large pointer for these sizes; we use New for <=96 and Large beyond. */
+#define RDP_CURSOR_NEW_MAX 96
+
+void rdp_peer_send_cursor_shape(freerdp_peer *peer,
+                                const uint8_t *bgra, uint32_t w, uint32_t h,
+                                uint16_t hotX, uint16_t hotY) {
+    if (!peer || !bgra || w == 0 || h == 0) return;
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+
+    /* Don't push pointers before the client is up: pre-activation the update
+     * channel isn't wired, and (like graphics) sends while output is suppressed
+     * are pointless. Mirrors rdp_peer_send_h264_frame's readiness gate. */
+    if (!ctx->activated) { rdp_debug("cursor: peer not activated"); return; }
+    if (ctx->outputSuppressed) return;
+
+    rdpPointerUpdate *pointer = peer->context->update->pointer;
+    if (!pointer) return;
+
+    /* Clamp hotspot inside the bitmap. */
+    if (hotX >= w) hotX = (uint16_t)(w - 1);
+    if (hotY >= h) hotY = (uint16_t)(h - 1);
+
+    /* ── Build the XOR (color) mask ───────────────────────────────────────
+     * RDP wants 32bpp BGRA scanlines BOTTOM-UP, each row DWORD-aligned. For
+     * 32bpp a row is w*4 bytes (already 4-byte aligned). Our input is top-down
+     * BGRA premultiplied, so we emit rows in reverse order. */
+    uint32_t xorStride = w * 4;
+    uint32_t xorLen    = xorStride * h;
+
+    /* ── Build the AND (transparency) mask ────────────────────────────────
+     * 1bpp, BOTTOM-UP, each scanline padded to a 2-byte boundary. A SET bit
+     * means "transparent" (client shows the underlying pixel). Derive it from
+     * alpha: alpha==0 -> transparent (bit 1), else opaque (bit 0). With a
+     * proper 32bpp alpha xor mask mstsc alpha-blends anyway, but a correct AND
+     * mask keeps fully transparent corners from painting black on clients that
+     * ignore alpha. */
+    uint32_t andRowBytes = ((w + 7u) / 8u);
+    andRowBytes = (andRowBytes + 1u) & ~1u;          /* pad to 2 bytes */
+    uint32_t andLen = andRowBytes * h;
+
+    uint8_t *xorData = (uint8_t *)malloc(xorLen);
+    uint8_t *andData = (uint8_t *)calloc(1, andLen); /* default opaque (0) */
+    if (!xorData || !andData) { free(xorData); free(andData); return; }
+
+    for (uint32_t y = 0; y < h; y++) {
+        const uint8_t *srcRow = bgra + (size_t)y * xorStride;
+        /* bottom-up: source row y goes to dest row (h-1-y). */
+        uint8_t *dstRow = xorData + (size_t)(h - 1 - y) * xorStride;
+        memcpy(dstRow, srcRow, xorStride);
+
+        uint8_t *andRow = andData + (size_t)(h - 1 - y) * andRowBytes;
+        for (uint32_t x = 0; x < w; x++) {
+            uint8_t alpha = srcRow[x * 4 + 3];   /* BGRA -> A at +3 */
+            if (alpha == 0) {
+                /* MSB-first bit order within each byte. */
+                andRow[x / 8] |= (uint8_t)(0x80u >> (x % 8));
+            }
+        }
+    }
+
+    UINT rc = CHANNEL_RC_OK;
+    bool ok = false;
+
+    pthread_mutex_lock(&ctx->xportLock);
+    if (w <= RDP_CURSOR_NEW_MAX && h <= RDP_CURSOR_NEW_MAX) {
+        if (pointer->PointerNew) {
+            POINTER_NEW_UPDATE upd = {0};
+            upd.xorBpp = 32;
+            upd.colorPtrAttr.cacheIndex    = 0;
+            upd.colorPtrAttr.hotSpotX      = hotX;
+            upd.colorPtrAttr.hotSpotY      = hotY;
+            upd.colorPtrAttr.width         = (UINT16)w;
+            upd.colorPtrAttr.height        = (UINT16)h;
+            upd.colorPtrAttr.lengthAndMask = (UINT16)andLen;
+            upd.colorPtrAttr.lengthXorMask = (UINT16)xorLen;
+            upd.colorPtrAttr.xorMaskData   = xorData;
+            upd.colorPtrAttr.andMaskData   = andData;
+            ok = pointer->PointerNew(peer->context, &upd) ? true : false;
+        }
+    } else if (pointer->PointerLarge) {
+        POINTER_LARGE_UPDATE upd = {0};
+        upd.xorBpp        = 32;
+        upd.cacheIndex    = 0;
+        upd.hotSpotX      = hotX;
+        upd.hotSpotY      = hotY;
+        upd.width         = (UINT16)w;
+        upd.height        = (UINT16)h;
+        upd.lengthAndMask = andLen;
+        upd.lengthXorMask = xorLen;
+        upd.xorMaskData   = xorData;
+        upd.andMaskData   = andData;
+        ok = pointer->PointerLarge(peer->context, &upd) ? true : false;
+    }
+    pthread_mutex_unlock(&ctx->xportLock);
+
+    free(xorData);
+    free(andData);
+
+    if (!ok) rdp_error("cursor send failed (rc=%u, %ux%u)", rc, w, h);
+    else     rdp_debug("sent cursor %ux%u hot=(%u,%u) xor=%u and=%u",
+                       w, h, hotX, hotY, xorLen, andLen);
+}
+
 bool rdp_peer_send_bitmap(freerdp_peer *peer,
                            const uint8_t *bgra, uint32_t x, uint32_t y,
                            uint32_t width, uint32_t height) {

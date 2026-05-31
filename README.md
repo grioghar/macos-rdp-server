@@ -22,6 +22,21 @@ A lightweight RDP server daemon for macOS Tahoe and later. Connect to your Mac f
 
 ## One-line install
 
+> [!IMPORTANT]
+> **Screen capture requires the daemon to run in your GUI (Aqua) login session.** The
+> system LaunchDaemon installed by the commands in this section has no WindowServer
+> connection and will render a **black screen**. For a working, durable setup — one that
+> also keeps the Screen Recording / Accessibility permission valid across updates — use
+> the per-user installer instead, after obtaining the binary:
+>
+> ```bash
+> scripts/install-user.sh /usr/local/sbin/macos-rdp-daemon   # or any path to the binary
+> ```
+>
+> It runs the daemon as a per-user LaunchAgent (Aqua session → WindowServer → capture
+> works) and signs it with a stable self-signed certificate, so macOS pins the permission
+> grant to the signature rather than the cdhash that changes on every rebuild. No sudo.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/grioghar/macos-rdp-server/master/scripts/remote-install.sh | sudo bash
 ```

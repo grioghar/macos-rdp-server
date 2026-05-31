@@ -22,7 +22,13 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface InputInjector : NSObject
 
-- (instancetype)initWithDisplayID:(CGDirectDisplayID)displayID;
+/* sourceWidth/Height are the RDP desktop dimensions the client sends pointer
+ * coordinates in (the negotiated/captured size). They are scaled to the Mac
+ * display's actual point bounds so clicks land correctly when the remote
+ * resolution differs from the Mac's (e.g. a Retina display). */
+- (instancetype)initWithDisplayID:(CGDirectDisplayID)displayID
+                      sourceWidth:(uint32_t)sourceWidth
+                     sourceHeight:(uint32_t)sourceHeight;
 
 - (void)injectKeyEvent:(uint16_t)flags scanCode:(uint16_t)code;
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y;

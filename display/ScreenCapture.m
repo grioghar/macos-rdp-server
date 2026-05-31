@@ -98,7 +98,8 @@
         cfg.pixelFormat          = kCVPixelFormatType_32BGRA;
         cfg.minimumFrameInterval = CMTimeMake(1, 30);   /* cap ~30 fps (RDP-sane) */
         cfg.queueDepth           = 5;
-        cfg.showsCursor          = YES;
+        cfg.showsCursor          = NO;   /* let the RDP client draw the cursor — compositing
+                                          * the Mac cursor too yields a laggy double cursor */
 
         SCStream *stream = [[SCStream alloc] initWithFilter:filter
                                               configuration:cfg

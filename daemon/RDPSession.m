@@ -178,7 +178,9 @@ static void rdp_on_keyframe_request(void *ud) {
         rdp_error("screen capture FAILED on displayID=%u — desktop will be black "
                   "until Screen Recording is granted", displayID);
 
-    _injector  = [[InputInjector alloc] initWithDisplayID:displayID];
+    _injector  = [[InputInjector alloc] initWithDisplayID:displayID
+                                              sourceWidth:width
+                                             sourceHeight:height];
     _clipboard = [[ClipboardSync alloc] init];
     _clipboard.sendToClientBlock = ^(const uint8_t *data, size_t len, uint32_t fmt) {
         rdp_verbose("sending clipboard to client: format=0x%08x len=%zu", fmt, len);

@@ -74,6 +74,8 @@ static const uint16_t kExtScanToVK[256] = {
 
 @interface InputInjector ()
 @property (nonatomic, assign) CGDirectDisplayID displayID;
+@property (nonatomic, assign) uint32_t srcW;   /* RDP desktop width  (pointer coord space) */
+@property (nonatomic, assign) uint32_t srcH;   /* RDP desktop height */
 /* Button state — needed to emit MouseDragged (not MouseMoved) while a button
  * is held, otherwise drags / text selection / window moves don't work. */
 @property (nonatomic, assign) BOOL leftDown;
@@ -83,9 +85,13 @@ static const uint16_t kExtScanToVK[256] = {
 
 @implementation InputInjector
 
-- (instancetype)initWithDisplayID:(CGDirectDisplayID)did {
+- (instancetype)initWithDisplayID:(CGDirectDisplayID)did
+                      sourceWidth:(uint32_t)sourceWidth
+                     sourceHeight:(uint32_t)sourceHeight {
     if ((self = [super init])) {
         _displayID = did;
+        _srcW = sourceWidth;
+        _srcH = sourceHeight;
         /* Prompt for Accessibility (required for CGEventPost) and register the
          * binary in the Privacy list. In the GUI session this pops the system
          * dialog the first time; thereafter it just reports the trust state. */
@@ -120,12 +126,14 @@ static const uint16_t kExtScanToVK[256] = {
 }
 
 - (void)injectMouseEvent:(uint16_t)flags x:(uint16_t)x y:(uint16_t)y {
-    CGPoint pos = CGPointMake(x, y);
-
-    /* Map virtual display coordinates to global screen coordinates. */
+    /* The client sends pointer coords in the RDP desktop space (0..srcW, 0..srcH).
+     * Scale them to the Mac display's actual point bounds — these differ on a Retina
+     * or differently-sized display, so a 1:1 map lands clicks in the wrong place. */
     CGRect bounds = CGDisplayBounds(_displayID);
-    pos.x += bounds.origin.x;
-    pos.y += bounds.origin.y;
+    double sx = (_srcW > 0) ? bounds.size.width  / (double)_srcW : 1.0;
+    double sy = (_srcH > 0) ? bounds.size.height / (double)_srcH : 1.0;
+    CGPoint pos = CGPointMake(bounds.origin.x + (double)x * sx,
+                              bounds.origin.y + (double)y * sy);
 
     BOOL down = (flags & RDP_PTR_DOWN) != 0;
     CGEventType type;

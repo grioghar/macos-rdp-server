@@ -91,9 +91,21 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         return;
     }
 
-    /* CGDisplayCapture + drawing-context fill is thread-safe and needs no run
-     * loop, so we run it inline on the session queue — the blank takes effect
-     * immediately and we avoid dispatching onto the blocked main thread. */
+    /* Privacy blanking is OPT-IN (RDP_PRIVACY_BLANK=1), default OFF.
+     * The CGDisplayCapture() approach blacks out the BUILT-IN, but capturing a
+     * display triggers a WindowServer reconfiguration that ALSO stops compositing
+     * to the virtual/remote display — the remote went all-black (frames still flow,
+     * but they are black). Until blanking is reimplemented non-disruptively (e.g.
+     * panel brightness -> 0 without a display-config change), it stays disabled so
+     * the remote view always works. Wake-on-connect power assertions above are
+     * unaffected and remain active. */
+    const char *blank = getenv("RDP_PRIVACY_BLANK");
+    if (!(blank && strcmp(blank, "1") == 0)) {
+        rdp_info("privacy blanking OFF (default; set RDP_PRIVACY_BLANK=1 to opt in — "
+                 "note: current method blacks the remote, rework pending)");
+        return;
+    }
+    rdp_info("RDP_PRIVACY_BLANK=1 — blanking built-in (may disrupt the remote view)");
     [self blankBuiltInDisplays];
     [self installInputMonitor];
 }

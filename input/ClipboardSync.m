@@ -4,16 +4,16 @@
 #include "logging/RDPLog.h"
 
 /*
- * NSPasteboardDidChangeNotification fires via NSDistributedNotificationCenter
- * whenever any process writes to the general pasteboard.
- * This replaces a 500ms poll with a zero-CPU push notification.
- * Available macOS 10.15+.
+ * macOS provides NO pasteboard-change notification (NSPasteboard has no KVO and
+ * no NSNotification for content changes — the previously-used
+ * "com.apple.pasteboard.application-active" distributed note does not fire on
+ * copy). The only reliable way to detect a copy is to poll NSPasteboard.changeCount.
+ * We poll a few times a second; when idle this is just an integer comparison.
  */
-static NSString *const kPasteboardChangedNote =
-    @"com.apple.pasteboard.application-active";
 
 @interface ClipboardSync ()
 @property (nonatomic, assign) NSInteger lastChangeCount;
+@property (nonatomic, strong) dispatch_source_t pollTimer;
 @end
 
 @implementation ClipboardSync
@@ -21,26 +21,28 @@ static NSString *const kPasteboardChangedNote =
 - (void)start {
     _lastChangeCount = NSPasteboard.generalPasteboard.changeCount;
 
-    [[NSDistributedNotificationCenter defaultCenter]
-        addObserver:self
-           selector:@selector(pasteboardChanged:)
-               name:kPasteboardChangedNote
-             object:nil
- suspensionBehavior:NSNotificationSuspensionBehaviorDeliverImmediately];
+    _pollTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0,
+                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(_pollTimer, dispatch_time(DISPATCH_TIME_NOW, 0),
+                              (uint64_t)(NSEC_PER_SEC / 4), NSEC_PER_SEC / 8); /* ~4 Hz */
+    __weak typeof(self) weak = self;
+    dispatch_source_set_event_handler(_pollTimer, ^{ [weak pollPasteboard]; });
+    dispatch_resume(_pollTimer);
 
-    rdp_verbose("clipboard sync started (event-driven)");
+    rdp_verbose("clipboard sync started (polling changeCount ~4Hz)");
 }
 
 - (void)stop {
-    [[NSDistributedNotificationCenter defaultCenter] removeObserver:self];
+    if (_pollTimer) { dispatch_source_cancel(_pollTimer); _pollTimer = nil; }
     rdp_verbose("clipboard sync stopped");
 }
 
-- (void)pasteboardChanged:(NSNotification *)note {
-    (void)note;
+/* Mac -> Windows: when the pasteboard changes, advertise the new contents. */
+- (void)pollPasteboard {
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
-    if (pb.changeCount == _lastChangeCount) return;
-    _lastChangeCount = pb.changeCount;
+    NSInteger cc = pb.changeCount;
+    if (cc == _lastChangeCount) return;
+    _lastChangeCount = cc;
 
     ClipboardSendBlock block = self.sendToClientBlock;
     if (!block) return;
@@ -49,18 +51,20 @@ static NSString *const kPasteboardChangedNote =
     if (str) {
         NSData *utf16 = [str dataUsingEncoding:NSUTF16LittleEndianStringEncoding];
         if (utf16) {
-            rdp_verbose("clipboard: sending %zu UTF-16 bytes to client", utf16.length);
+            rdp_verbose("clipboard: Mac copy -> %zu UTF-16 bytes to client",
+                        (size_t)utf16.length);
             block((const uint8_t *)utf16.bytes, utf16.length, RDP_CB_FORMAT_UNICODETEXT);
         }
         return;
     }
     NSData *png = [pb dataForType:NSPasteboardTypePNG];
     if (png) {
-        rdp_verbose("clipboard: sending %zu PNG bytes to client", png.length);
+        rdp_verbose("clipboard: Mac copy -> %zu PNG bytes to client", (size_t)png.length);
         block((const uint8_t *)png.bytes, png.length, RDP_CB_FORMAT_PNG);
     }
 }
 
+/* Windows -> Mac: client sent clipboard data; place it on the Mac pasteboard. */
 - (void)receiveFromClient:(const uint8_t *)data length:(size_t)len format:(uint32_t)format {
     NSPasteboard *pb = NSPasteboard.generalPasteboard;
     [pb clearContents];
@@ -70,7 +74,7 @@ static NSString *const kPasteboardChangedNote =
                 encoding:NSUTF16LittleEndianStringEncoding];
         if (str) {
             [pb setString:str forType:NSPasteboardTypeString];
-            _lastChangeCount = pb.changeCount;
+            _lastChangeCount = pb.changeCount;  /* don't bounce it back to the client */
             rdp_verbose("clipboard: received %zu bytes from client (text)", len);
         }
     } else if (format == RDP_CB_FORMAT_PNG) {

@@ -327,7 +327,28 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
             rdp_verbose("clipboard channel open failed");
             cliprdr_server_context_free(ctx->cliprdr);
             ctx->cliprdr = NULL;
-        } else { rdp_verbose("clipboard channel opened"); }
+        } else {
+            /* We pump the channel via the shared VCM, NOT cliprdr's own Start()
+             * thread — so the server-init handshake (Clipboard Capabilities +
+             * Monitor Ready) is never sent automatically. Send it ourselves, or
+             * the client never engages and copy/paste is dead BOTH directions. */
+            CLIPRDR_GENERAL_CAPABILITY_SET general = {
+                .capabilitySetType   = CB_CAPSTYPE_GENERAL,
+                .capabilitySetLength = CB_CAPSTYPE_GENERAL_LEN,
+                .version             = CB_CAPS_VERSION_2,
+                .generalFlags        = CB_USE_LONG_FORMAT_NAMES,
+            };
+            CLIPRDR_CAPABILITIES caps = {
+                .common = { .msgType = CB_CLIP_CAPS, .msgFlags = 0,
+                            .dataLen = 4 + CB_CAPSTYPE_GENERAL_LEN },
+                .cCapabilitiesSets = 1,
+                .capabilitySets = (CLIPRDR_CAPABILITY_SET *)&general,
+            };
+            CLIPRDR_MONITOR_READY ready = { .common = { .msgType = CB_MONITOR_READY } };
+            UINT cc = ctx->cliprdr->ServerCapabilities(ctx->cliprdr, &caps);
+            UINT mr = ctx->cliprdr->MonitorReady(ctx->cliprdr, &ready);
+            rdp_verbose("clipboard channel opened (caps=%u monitor-ready=%u)", cc, mr);
+        }
     }
 
     /* Audio. Advertise ONLY raw PCM matching what AudioCapture produces

@@ -360,47 +360,140 @@ static UINT cliprdr_client_format_data_request(
 
 /* ── Audio activated callback ──────────────────────────────────────────── */
 
+/* Preferred client playback rate (Hz) from RDP_AUDIO_RATE, or 0 for "auto".
+ *
+ * mstsc commonly PLAYS rdpsnd at its 44100 device rate even when it advertises
+ * 48000, so a 48000-tagged stream sounds a semitone low (44100/48000 = 0.919 —
+ * exactly the reported drop). Preferring 44100 makes captured-rate == play-rate
+ * and removes the shift. Gated behind an env var so the rate can be A/B tested
+ * on hardware without a rebuild:
+ *   "44100" (default) → prefer 44100 stereo 16-bit PCM
+ *   "48000"           → prefer 48000
+ *   "auto"            → no preference; take the first compatible client format */
+static uint32_t rdp_preferred_audio_rate(void) {
+    const char *env = getenv("RDP_AUDIO_RATE");
+    if (!env || !*env)               return 44100;  /* default */
+    if (strcmp(env, "auto") == 0)    return 0;
+    long v = strtol(env, NULL, 10);
+    if (v == 44100 || v == 48000 || v == 22050) return (uint32_t)v;
+    rdp_info("RDP_AUDIO_RATE=\"%s\" not recognized — defaulting to 44100", env);
+    return 44100;
+}
+
 static void rdpsnd_activated(RdpsndServerContext *rdpsnd) {
     RDPPeerContext *ctx = (RDPPeerContext *)rdpsnd->data;
 
-    /* Pick the first mutually-supported PCM format.
-     *
-     * CRITICAL (pitch bug): rdpsnd_server_send_samples() does NOT resample. It
+    /* ── Diagnostics: dump the FULL negotiation so the real client offer is
+     * visible in the log (the human reads this to confirm/choose the rate). */
+    rdp_info("===== rdpsnd negotiation: %u client format(s) advertised =====",
+             (unsigned)rdpsnd->num_client_formats);
+    for (UINT16 i = 0; i < rdpsnd->num_client_formats; i++) {
+        const AUDIO_FORMAT *cf = &rdpsnd->client_formats[i];
+        rdp_info("  client[%u]: %u Hz, %u ch, %u-bit, tag 0x%04x, "
+                 "blockAlign %u, avgBytes %u",
+                 (unsigned)i, (unsigned)cf->nSamplesPerSec,
+                 (unsigned)cf->nChannels, (unsigned)cf->wBitsPerSample,
+                 (unsigned)cf->wFormatTag, (unsigned)cf->nBlockAlign,
+                 (unsigned)cf->nAvgBytesPerSec);
+    }
+    rdp_info("----- server advertised %u format(s) -----",
+             (unsigned)rdpsnd->num_server_formats);
+    for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
+        const AUDIO_FORMAT *sf = &rdpsnd->server_formats[j];
+        rdp_info("  server[%zu]: %u Hz, %u ch, %u-bit, tag 0x%04x",
+                 j, (unsigned)sf->nSamplesPerSec, (unsigned)sf->nChannels,
+                 (unsigned)sf->wBitsPerSample, (unsigned)sf->wFormatTag);
+    }
+
+    /* CRITICAL (pitch bug): rdpsnd_server_send_samples() does NOT resample. It
      * encodes the bytes we hand it (described by ctx->rdpsnd->src_format) and
      * tags the WAVE PDU with wFormatNo = selected_client_format — an index into
-     * the CLIENT's format list. The client therefore plays our bytes at the
-     * SELECTED CLIENT FORMAT's nSamplesPerSec. If that rate differs from the
-     * rate at which we actually produced the PCM, the client plays it
-     * faster/slower → the audio is pitch-shifted (mstsc commonly negotiates
-     * 44100, so 48000-captured bytes replayed as 44100 sound a few semitones
-     * off, exactly the reported symptom).
+     * the CLIENT's format list. The client plays our bytes at the SELECTED
+     * CLIENT FORMAT's nSamplesPerSec. If that rate differs from the rate we
+     * actually produced the PCM at, the client plays it faster/slower → pitch
+     * shift.
      *
-     * Guarantee src == play rate by (a) advertising the standard rates mstsc
-     * expects so a clean PCM match exists, and (b) pointing src_format at the
-     * EXACT client format we selected, then resampling the 48 kHz tap to that
-     * negotiated rate in AudioCapture (it polls rdp_peer_get_audio_rate). */
-    for (UINT16 i = 0; i < rdpsnd->num_client_formats; i++) {
+     * Guarantee src == play rate by (a) selecting a client format at the
+     * PREFERRED rate (RDP_AUDIO_RATE, default 44100 — mstsc's usual device
+     * rate), (b) pointing src_format at that EXACT client format BEFORE calling
+     * SelectFormat (SelectFormat snapshots src_format to compute its
+     * bytes-per-frame), and (c) resampling the 48 kHz tap to that negotiated
+     * rate in AudioCapture (it polls rdp_peer_get_audio_rate).
+     *
+     * Two passes: first try to match the preferred rate; if the client offers
+     * no compatible format at that rate, fall back to the first compatible
+     * format of any rate so audio still works (just possibly shifted). */
+    const uint32_t preferred = rdp_preferred_audio_rate();
+    rdp_info("audio rate preference: %s (RDP_AUDIO_RATE)",
+             preferred ? (preferred == 44100 ? "44100" :
+                          preferred == 48000 ? "48000" : "22050") : "auto");
+
+    int chosen = -1;
+    /* Pass 1: preferred rate (skipped when preferred == 0 / "auto"). */
+    if (preferred) {
+        for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
+            if (rdpsnd->client_formats[i].nSamplesPerSec != preferred) continue;
+            for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
+                if (audio_format_compatible(&rdpsnd->server_formats[j],
+                                            &rdpsnd->client_formats[i])) {
+                    chosen = (int)i;
+                    break;
+                }
+            }
+        }
+        if (chosen < 0)
+            rdp_info("no compatible client format at preferred %u Hz — "
+                     "falling back to first compatible format", preferred);
+    }
+    /* Pass 2: first compatible format of any rate. */
+    for (UINT16 i = 0; i < rdpsnd->num_client_formats && chosen < 0; i++) {
         for (size_t j = 0; j < rdpsnd->num_server_formats; j++) {
             if (audio_format_compatible(&rdpsnd->server_formats[j],
                                         &rdpsnd->client_formats[i])) {
-                rdpsnd->SelectFormat(rdpsnd, i);
-                /* Feed SendSamples PCM described EXACTLY as the client will play
-                 * it, so the encoder's source rate equals the wire rate and no
-                 * implicit reinterpretation (pitch shift) can occur. */
-                rdpsnd->src_format = &rdpsnd->client_formats[i];
-                const AUDIO_FORMAT *sel = &rdpsnd->client_formats[i];
-                ctx->audioReady = true;
-                rdp_info("audio format negotiated: client idx %u — "
-                         "%u Hz, %u ch, %u-bit, tag 0x%04x (src=play rate)",
-                         (unsigned)i, (unsigned)sel->nSamplesPerSec,
-                         (unsigned)sel->nChannels, (unsigned)sel->wBitsPerSample,
-                         (unsigned)sel->wFormatTag);
-                return;
+                chosen = (int)i;
+                break;
             }
         }
     }
-    rdp_error("no compatible audio format found among %u client formats",
-              (unsigned)rdpsnd->num_client_formats);
+
+    if (chosen < 0) {
+        rdp_error("no compatible audio format found among %u client formats",
+                  (unsigned)rdpsnd->num_client_formats);
+        return;
+    }
+
+    const AUDIO_FORMAT *sel = &rdpsnd->client_formats[chosen];
+    /* Point src_format at the selected client format BEFORE SelectFormat —
+     * SelectFormat reads src_format to compute src bytes-per-frame, and it is
+     * the format SendSamples describes the PCM with, so it MUST equal the
+     * client format we tag the wire with (same rate/ch/bits ⇒ no implicit
+     * reinterpretation / pitch shift). */
+    rdpsnd->src_format = (AUDIO_FORMAT *)sel;
+    UINT rc = rdpsnd->SelectFormat(rdpsnd, (UINT16)chosen);
+    if (rc != CHANNEL_RC_OK) {
+        rdp_error("SelectFormat(idx %d) failed rc=%u — audio disabled",
+                  chosen, (unsigned)rc);
+        return;
+    }
+
+    /* Confirm SelectFormat actually committed the index we passed: the wire
+     * wFormatNo and rdp_peer_get_audio_rate both read selected_client_format,
+     * so a mismatch here would mean we resample to one rate but tag another. */
+    UINT16 committed = rdpsnd->selected_client_format;
+    if (committed != (UINT16)chosen) {
+        rdp_error("selected_client_format mismatch: passed %d but context holds "
+                  "%u — wire wFormatNo would disagree with resample rate!",
+                  chosen, (unsigned)committed);
+    }
+
+    ctx->audioReady = true;
+    rdp_info("audio format negotiated: client idx %d (committed %u) — "
+             "%u Hz, %u ch, %u-bit, tag 0x%04x — wire wFormatNo=%u, "
+             "tap will resample to %u Hz (src=play rate)",
+             chosen, (unsigned)committed,
+             (unsigned)sel->nSamplesPerSec, (unsigned)sel->nChannels,
+             (unsigned)sel->wBitsPerSample, (unsigned)sel->wFormatTag,
+             (unsigned)committed, (unsigned)sel->nSamplesPerSec);
 }
 
 /* Negotiated client playback sample rate (Hz), or 0 if audio is not yet
@@ -496,10 +589,12 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
      * at the selected client format and AudioCapture resamples the 48 kHz tap to
      * that exact rate (rdp_peer_get_audio_rate), so captured rate == play rate.
      *
-     * Must be heap-allocated: rdpsnd_server_context_free() calls free() on
-     * server_formats, so a static array would crash on teardown. Order matters:
-     * the negotiation loop picks the first client format compatible with ANY
-     * server format, so list the highest fidelity (48000) first. */
+     * rdpsnd_activated PREFERS the RDP_AUDIO_RATE rate (default 44100 — mstsc's
+     * usual playback device rate) when the client offers it, falling back to the
+     * first compatible format otherwise; list order here is no longer the
+     * tie-breaker, but all three rates must be advertised so the preferred one
+     * can match. Must be heap-allocated: rdpsnd_server_context_free() calls
+     * free() on server_formats, so a static array would crash on teardown. */
     ctx->rdpsnd = rdpsnd_server_context_new(ctx->vcm);
     if (ctx->rdpsnd) {
         static const UINT32 kRates[] = { 48000, 44100, 22050 };

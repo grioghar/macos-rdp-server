@@ -79,11 +79,27 @@ static const uint32_t kDefaultBitrate = 8000;
     _sessionState = RDPSessionStateNegotiating;
     rdp_verbose("RDP negotiation started with %s", _address.UTF8String);
 
+    uint32_t lastAudioRate = 0;
     while (_sessionState != RDPSessionStateDisconnecting &&
            _sessionState != RDPSessionStateDisconnected) {
         if (!rdp_peer_run_once(_peer)) {
             rdp_verbose("peer loop ended for %s", _address.UTF8String);
             break;
+        }
+        /* rdpsnd format negotiation completes asynchronously (Activated callback)
+         * AFTER audio capture starts. The client plays our PCM at the rate IT
+         * selected — rdpsnd does not resample — so the tap must be resampled to
+         * that exact rate or the audio is pitch-shifted. Poll the negotiated rate
+         * and push it to AudioCapture once known/changed. Cheap; the setter
+         * no-ops when unchanged. */
+        if (_audio) {
+            uint32_t rate = rdp_peer_get_audio_rate(_peer);
+            if (rate && rate != lastAudioRate) {
+                _audio.outputSampleRate = rate;
+                rdp_info("audio playback rate negotiated: %u Hz — "
+                         "tap resampled to match (no pitch shift)", (unsigned)rate);
+                lastAudioRate = rate;
+            }
         }
     }
 

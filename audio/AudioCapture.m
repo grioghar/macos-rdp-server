@@ -2,6 +2,7 @@
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreAudio/CoreAudio.h>
 #include <math.h>
+#include <mach/mach_time.h>
 
 /* macOS 14.4+ Core Audio process-tap API. These headers ship with the
  * 14.4+ SDK; the symbols are weak-linked and guarded with @available so the
@@ -15,9 +16,13 @@
 #define RDP_LOG_COMPONENT "audio"
 #include "logging/RDPLog.h"
 
-/* RDP side negotiated WAVE_FORMAT_PCM / 48000 Hz / 2ch / 16-bit. */
-static const double   kRDPSampleRate = 48000.0;
-static const uint32_t kRDPChannels   = 2;
+#include <stdatomic.h>
+
+/* Default output rate before rdpsnd negotiation tells us the client's actual
+ * playback rate. The tap is resampled to whatever outputSampleRate currently
+ * holds; this is just the starting value. */
+static const uint32_t kDefaultOutRate = 48000;
+static const uint32_t kRDPChannels    = 2;
 
 static inline int16_t clampF32(float f) {
     if (f >  1.0f) f =  1.0f;
@@ -25,7 +30,20 @@ static inline int16_t clampF32(float f) {
     return (int16_t)lrintf(f * 32767.0f);
 }
 
-@interface AudioCapture ()
+@interface AudioCapture () {
+    /* Target output rate, written by setOutputSampleRate: (possibly from
+     * another thread) and read by the real-time IO proc. Atomic so the IO proc
+     * sees a consistent value without taking a lock on the audio thread. */
+    _Atomic uint32_t _outRate;
+
+    /* Wall-clock delivery-rate diagnostic: input frames seen since the last log
+     * and the host-time of that last log, so we can compare the REAL frames/sec
+     * the IO proc delivers against the queried srcSampleRate (a mismatch there
+     * would itself cause a pitch shift). */
+    uint64_t _diagFrames;
+    uint64_t _diagLastHostTime;
+    double   _hostTicksToSeconds;
+}
 @property (nonatomic, assign) AudioObjectID       tapID;        /* process tap            */
 @property (nonatomic, assign) AudioObjectID       aggID;        /* private aggregate dev  */
 @property (nonatomic, assign) AudioDeviceIOProcID ioProcID;
@@ -55,11 +73,27 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     if ((self = [super init])) {
         _tapID = kAudioObjectUnknown;
         _aggID = kAudioObjectUnknown;
+        atomic_store_explicit(&_outRate, kDefaultOutRate, memory_order_relaxed);
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        _hostTicksToSeconds = (double)tb.numer / (double)tb.denom / 1.0e9;
     }
     return self;
 }
 
 - (BOOL)isCapturing { return _capturing; }
+
+- (uint32_t)outputSampleRate {
+    return atomic_load_explicit(&_outRate, memory_order_relaxed);
+}
+
+- (void)setOutputSampleRate:(uint32_t)rate {
+    if (rate == 0) return;  /* ignore: keep current rate */
+    uint32_t prev = atomic_exchange_explicit(&_outRate, rate, memory_order_relaxed);
+    if (prev != rate)
+        rdp_info("audio output rate set to %u Hz (resampling tap %.0f Hz -> %u Hz)",
+                 (unsigned)rate, _srcSampleRate, (unsigned)rate);
+}
 
 - (BOOL)failWithError:(NSError **)error code:(OSStatus)code msg:(const char *)msg {
     rdp_error("%s (status %d)", msg, (int)code);
@@ -181,12 +215,36 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     _srcChannels   = asbd.mChannelsPerFrame;
     _resamplePhase = 0.0;
     _haveLast      = NO;
+    _diagFrames       = 0;
+    _diagLastHostTime = 0;
     rdp_info("tap input format: %.0f Hz, %u ch, %u bits, flags 0x%x",
              asbd.mSampleRate, (unsigned)asbd.mChannelsPerFrame,
              (unsigned)asbd.mBitsPerChannel, (unsigned)asbd.mFormatFlags);
-    if (_srcSampleRate != kRDPSampleRate)
-        rdp_info("tap rate %.0f Hz != %.0f Hz — linear-resampling to 48k",
-                 _srcSampleRate, kRDPSampleRate);
+
+    /* Cross-check: the device's nominal sample rate. If it disagrees with the
+     * stream-format rate above, the IO proc may actually deliver frames at the
+     * nominal rate — using the wrong _srcSampleRate in the resampler would
+     * itself pitch-shift. Prefer the stream-format rate (that's the layout of
+     * the bytes), but log the nominal so a mismatch is visible. */
+    Float64 nominal = 0;
+    UInt32 nsz = sizeof(nominal);
+    AudioObjectPropertyAddress nomAddr = {
+        .mSelector = kAudioDevicePropertyNominalSampleRate,
+        .mScope    = kAudioObjectPropertyScopeGlobal,
+        .mElement  = kAudioObjectPropertyElementMain,
+    };
+    if (AudioObjectGetPropertyData(_aggID, &nomAddr, 0, NULL, &nsz, &nominal) == noErr) {
+        rdp_info("tap nominal sample rate: %.0f Hz", nominal);
+        if (nominal > 0 && fabs(nominal - _srcSampleRate) > 1.0)
+            rdp_info("WARNING: nominal rate %.0f Hz != stream-format rate %.0f Hz "
+                     "— delivered frames/sec diagnostic will confirm the real rate",
+                     nominal, _srcSampleRate);
+    }
+
+    uint32_t outRate = atomic_load_explicit(&_outRate, memory_order_relaxed);
+    if (_srcSampleRate != (double)outRate)
+        rdp_info("tap rate %.0f Hz != output %u Hz — linear-resampling",
+                 _srcSampleRate, (unsigned)outRate);
 
     /* 6. Register IO proc + start. */
     err = AudioDeviceCreateIOProcID(_aggID, audio_io_proc,
@@ -238,8 +296,10 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
 }
 
 /* Convert one IO-proc buffer (float32, _srcChannels, _srcSampleRate) into
- * interleaved int16 stereo at 48 kHz and deliver via captureBlock. */
-- (void)handleInput:(const AudioBufferList *)bufList {
+ * interleaved int16 stereo at the current output rate (_outRate, == the rate
+ * the RDP client plays at) and deliver via captureBlock. hostTime is the
+ * buffer's mach host time, used only for the delivery-rate diagnostic. */
+- (void)handleInput:(const AudioBufferList *)bufList hostTime:(uint64_t)hostTime {
     AudioCaptureBlock cb = self.captureBlock;
     if (!cb || !bufList || bufList->mNumberBuffers == 0) return;
 
@@ -255,11 +315,36 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
 
     _framesCaptured += inFrames;
 
-    const double ratio = (_srcSampleRate > 0 ? kRDPSampleRate / _srcSampleRate
-                                              : 1.0);
+    /* Delivery-rate diagnostic: measure the REAL input frames/sec over
+     * wall-clock and compare to the queried _srcSampleRate. A large gap means
+     * the IO proc delivers at a different rate than we resample from, which
+     * would pitch-shift. Logged ~every 5 s; cheap (no allocation). */
+    if (hostTime && _hostTicksToSeconds > 0) {
+        _diagFrames += inFrames;
+        if (_diagLastHostTime == 0) {
+            _diagLastHostTime = hostTime;
+        } else {
+            double elapsed = (double)(hostTime - _diagLastHostTime) *
+                             _hostTicksToSeconds;
+            if (elapsed >= 5.0) {
+                double measured = (double)_diagFrames / elapsed;
+                rdp_info("audio delivery: %.0f frames/sec measured "
+                         "(queried src %.0f Hz, output %u Hz)",
+                         measured, _srcSampleRate,
+                         (unsigned)atomic_load_explicit(&_outRate,
+                                                        memory_order_relaxed));
+                _diagFrames       = 0;
+                _diagLastHostTime = hostTime;
+            }
+        }
+    }
 
-    /* Fast path: already 48k — just downmix/upmix to stereo int16. */
-    if (_srcSampleRate == kRDPSampleRate) {
+    const double outRate = (double)atomic_load_explicit(&_outRate,
+                                                        memory_order_relaxed);
+    const double ratio = (_srcSampleRate > 0 ? outRate / _srcSampleRate : 1.0);
+
+    /* Fast path: source already at the output rate — just downmix to stereo. */
+    if (_srcSampleRate == outRate) {
         int16_t *pcm = (int16_t *)malloc((size_t)inFrames * kRDPChannels *
                                          sizeof(int16_t));
         if (!pcm) return;
@@ -274,7 +359,7 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
         return;
     }
 
-    /* Linear resample to 48k stereo. Generate output frames by walking a
+    /* Linear resample to output-rate stereo. Generate output frames by walking a
      * fractional read position across the input block, carrying the tail
      * sample between callbacks for continuity. */
     uint32_t maxOut = (uint32_t)((inFrames + 1) * ratio) + 2;
@@ -344,10 +429,19 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
                                const AudioTimeStamp *inputTime,
                                AudioBufferList *outputData,
                                const AudioTimeStamp *outputTime, void *clientData) {
-    (void)device; (void)now; (void)inputTime; (void)outputTime; (void)outputData;
+    (void)device; (void)outputTime; (void)outputData;
     AudioCapture *capture = (__bridge AudioCapture *)clientData;
     if (capture && inputData) {
-        [capture handleInput:inputData];
+        /* Prefer the input timestamp's host time for the delivery-rate
+         * diagnostic; fall back to `now` if the input clock is unset. */
+        uint64_t hostTime = 0;
+        if (inputTime && (inputTime->mFlags & kAudioTimeStampHostTimeValid))
+            hostTime = inputTime->mHostTime;
+        else if (now && (now->mFlags & kAudioTimeStampHostTimeValid))
+            hostTime = now->mHostTime;
+        else
+            hostTime = mach_absolute_time();
+        [capture handleInput:inputData hostTime:hostTime];
     }
     return noErr;
 }

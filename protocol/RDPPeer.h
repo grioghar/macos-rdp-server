@@ -103,6 +103,15 @@ bool rdp_peer_send_bitmap(freerdp_peer *peer,
 bool rdp_peer_send_audio(freerdp_peer *peer,
                           const int16_t *samples, uint32_t frame_count);
 
+/* Negotiated client audio playback sample rate in Hz, or 0 if audio is not yet
+ * activated (rdpsnd Activated callback has not fired, or no compatible format).
+ *
+ * rdpsnd does NOT resample: the client plays the PCM bytes we send at the rate
+ * of the format IT selected. AudioCapture polls this to drive its resampler so
+ * the captured/sent rate equals the client's playback rate (otherwise the audio
+ * is pitch-shifted). Safe to call from any thread. */
+uint32_t rdp_peer_get_audio_rate(freerdp_peer *peer);
+
 bool rdp_peer_send_clipboard(freerdp_peer *peer,
                               const uint8_t *data, size_t len,
                               uint32_t format);

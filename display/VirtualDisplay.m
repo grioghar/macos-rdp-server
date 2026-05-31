@@ -98,7 +98,11 @@
         @try { [desc setValue:dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0)
                        forKey:@"queue"]; } @catch (id e) {}
 
-        id vd = [[dispClass alloc] initWithDescriptor:desc];
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        id vd = [[dispClass alloc] performSelector:@selector(initWithDescriptor:)
+                                         withObject:desc];
+#pragma clang diagnostic pop
         if (!vd) { rdp_error("CGVirtualDisplay init failed — main display"); return; }
 
         /* Build a mode via NSInvocation (scalar args). Signature is assumed

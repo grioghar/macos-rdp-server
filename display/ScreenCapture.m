@@ -98,8 +98,13 @@
         cfg.pixelFormat          = kCVPixelFormatType_32BGRA;
         cfg.minimumFrameInterval = CMTimeMake(1, 30);   /* cap ~30 fps (RDP-sane) */
         cfg.queueDepth           = 5;
-        cfg.showsCursor          = NO;   /* let the RDP client draw the cursor — compositing
-                                          * the Mac cursor too yields a laggy double cursor */
+        /* Show the macOS cursor composited into the capture by default, so the user
+         * sees the real Mac pointer (I-beam, resize, beachball, etc.). Configurable
+         * via RDP_SHOW_CURSOR=0 to hide it (e.g. if the client's own cursor is
+         * preferred and the double-cursor is distracting). A GUI config tool can set
+         * this env var in the LaunchAgent. */
+        const char *showCur = getenv("RDP_SHOW_CURSOR");
+        cfg.showsCursor          = (showCur && showCur[0] == '0') ? NO : YES;
 
         SCStream *stream = [[SCStream alloc] initWithFilter:filter
                                               configuration:cfg

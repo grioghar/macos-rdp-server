@@ -229,6 +229,42 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
 
 /* ── Clipboard callbacks ───────────────────────────────────────────────── */
 
+/* The client sent us ITS Clipboard Capabilities (MS-RDPECLIP step 3). This is
+ * the first proof mstsc accepted our caps + monitor-ready and is engaging the
+ * channel. We just log it; the channel layer has already latched the negotiated
+ * flags (e.g. useLongFormatNames) onto the context. */
+static UINT cliprdr_client_capabilities(CliprdrServerContext *cliprdr,
+                                        const CLIPRDR_CAPABILITIES *caps) {
+    (void)cliprdr;
+    UINT32 flags = 0, version = 0;
+    for (UINT32 i = 0; i < caps->cCapabilitiesSets; i++) {
+        const CLIPRDR_CAPABILITY_SET *set = &caps->capabilitySets[i];
+        if (set->capabilitySetType == CB_CAPSTYPE_GENERAL) {
+            const CLIPRDR_GENERAL_CAPABILITY_SET *g =
+                (const CLIPRDR_GENERAL_CAPABILITY_SET *)set;
+            version = g->version;
+            flags   = g->generalFlags;
+        }
+    }
+    rdp_verbose("clipboard: <- ClientCapabilities (%u sets, version=0x%08x "
+                "generalFlags=0x%08x longNames=%d)",
+                caps->cCapabilitiesSets, version, flags,
+                (flags & CB_USE_LONG_FORMAT_NAMES) ? 1 : 0);
+    return CHANNEL_RC_OK;
+}
+
+/* The client ACKed our Format List (our Mac->Win advertise). On success it will
+ * follow up with a Format Data Request when the user pastes on Windows. */
+static UINT cliprdr_client_format_list_response(
+        CliprdrServerContext *cliprdr,
+        const CLIPRDR_FORMAT_LIST_RESPONSE *resp) {
+    (void)cliprdr;
+    rdp_verbose("clipboard: <- ClientFormatListResponse (flags=0x%04x %s)",
+                resp->common.msgFlags,
+                (resp->common.msgFlags & CB_RESPONSE_OK) ? "OK" : "FAIL");
+    return CHANNEL_RC_OK;
+}
+
 /* Windows copied something: the client advertises the formats it now holds. We
  * must (a) ACK the list, then (b) PULL the bytes we care about by sending a Format
  * Data Request — the client never pushes data unsolicited. We only consume text,
@@ -236,7 +272,11 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
 static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_LIST *list) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
-    rdp_verbose("clipboard: client advertised %u formats", list->numFormats);
+    rdp_verbose("clipboard: <- ClientFormatList (%u formats)", list->numFormats);
+    for (UINT32 i = 0; i < list->numFormats; i++)
+        rdp_verbose("clipboard:    format[%u] id=0x%08x name=%s", i,
+                    list->formats[i].formatId,
+                    list->formats[i].formatName ? list->formats[i].formatName : "(none)");
 
     /* Acknowledge the advertisement first (msgType is set by the server serializer,
      * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
@@ -274,6 +314,8 @@ static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
 static UINT cliprdr_client_format_data(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_DATA_RESPONSE *resp) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
+    rdp_verbose("clipboard: <- ClientFormatDataResponse (flags=0x%04x len=%u)",
+                resp->common.msgFlags, resp->common.dataLen);
     if ((resp->common.msgFlags & CB_RESPONSE_OK) && ctx->callbacks.onClipboard) {
         rdp_verbose("clipboard: %u bytes from client (format 0x%08x)",
                     resp->common.dataLen, ctx->clipReqFormat);
@@ -296,6 +338,8 @@ static UINT cliprdr_client_format_data_request(
         const CLIPRDR_FORMAT_DATA_REQUEST *req) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
     CLIPRDR_FORMAT_DATA_RESPONSE resp = {0};
+    rdp_verbose("clipboard: <- ClientFormatDataRequest (format 0x%08x)",
+                req->requestedFormatId);
 
     if (ctx->clipData && ctx->clipLen > 0 &&
         req->requestedFormatId == ctx->clipFormat) {
@@ -364,7 +408,11 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     if (ctx->cliprdr) {
         ctx->cliprdr->custom                   = ctx;
         ctx->cliprdr->rdpcontext               = peer->context;
+        /* Register EVERY inbound callback BEFORE Open() so no client PDU is
+         * dropped, and so the log shows the full MS-RDPECLIP exchange. */
+        ctx->cliprdr->ClientCapabilities       = cliprdr_client_capabilities;
         ctx->cliprdr->ClientFormatList         = cliprdr_client_format_list;
+        ctx->cliprdr->ClientFormatListResponse = cliprdr_client_format_list_response;
         ctx->cliprdr->ClientFormatDataResponse = cliprdr_client_format_data;
         ctx->cliprdr->ClientFormatDataRequest  = cliprdr_client_format_data_request;
         ctx->cliprdr->useLongFormatNames       = TRUE;
@@ -563,6 +611,21 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         if (gfxEvent) events[nCount++] = gfxEvent;
     }
 
+    /* Clipboard channel event. cliprdr is a STATIC virtual channel opened in
+     * PostConnect, so its event handle is valid as soon as Open() succeeded —
+     * no drdynvc dependency (unlike GFX). We pump it here via the shared run
+     * loop instead of cliprdr's own Start() reader thread (which would race the
+     * transport against this loop and the encoder thread). WITHOUT this wait +
+     * the drain below, cliprdr_server_read is NEVER called, so the client's
+     * ClientCapabilities / ClientFormatList / FormatDataRequest /
+     * FormatDataResponse PDUs are never read off the wire — copy/paste is dead
+     * BOTH directions even though our outbound caps/monitor-ready/format-list
+     * were sent fine. THIS was the bug. */
+    if (ctx->cliprdr) {
+        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
+        if (clipEvent) events[nCount++] = clipEvent;
+    }
+
     DWORD status = WaitForMultipleObjects(nCount, events, FALSE, 50 /*ms*/);
     if (status == WAIT_FAILED) {
         rdp_error("WaitForMultipleObjects failed");
@@ -612,6 +675,21 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         HANDLE gfxEvent = rdpgfx_server_get_event_handle(ctx->gfx);
         if (gfxEvent && WaitForSingleObject(gfxEvent, 0) == WAIT_OBJECT_0) {
             rdpgfx_server_handle_messages(ctx->gfx);
+        }
+    }
+
+    /* Drain clipboard channel messages. CheckEventHandle == cliprdr_server_read:
+     * it reads one PDU off the static channel and dispatches it to our Client*
+     * callbacks, which themselves write responses (FormatListResponse,
+     * FormatDataRequest/Response) back over the transport — hence it MUST run
+     * under xportLock, which we already hold here. This is what finally lets us
+     * SEE the client engage the clipboard. */
+    if (ok && ctx->cliprdr) {
+        HANDLE clipEvent = ctx->cliprdr->GetEventHandle(ctx->cliprdr);
+        if (clipEvent && WaitForSingleObject(clipEvent, 0) == WAIT_OBJECT_0) {
+            UINT crc = ctx->cliprdr->CheckEventHandle(ctx->cliprdr);
+            if (crc != CHANNEL_RC_OK)
+                rdp_verbose("clipboard read failed: %u", crc);
         }
     }
 

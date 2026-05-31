@@ -180,26 +180,14 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
     UINT32 w = freerdp_settings_get_uint32(s, FreeRDP_DesktopWidth);
     UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
 
-    /* MS-RDPEGFX requires a RESET_GRAPHICS PDU to define the output canvas and
-     * monitor layout BEFORE any surface will be composited to the screen. Without
-     * it the client decodes surface commands but has no output to paint them onto,
-     * so the desktop stays black even though frames arrive without error. The
-     * shadow server sends this; we were omitting it. Monitor coords are inclusive
-     * (width = right - left + 1), flags 0x1 = TS_MONITOR_PRIMARY. */
-    MONITOR_DEF monitor = {0};
-    monitor.left   = 0;
-    monitor.top    = 0;
-    monitor.right  = (INT32)w - 1;
-    monitor.bottom = (INT32)h - 1;
-    monitor.flags  = 0x01; /* TS_MONITOR_PRIMARY */
-    RDPGFX_RESET_GRAPHICS_PDU reset = {0};
-    reset.width           = w;
-    reset.height          = h;
-    reset.monitorCount    = 1;
-    reset.monitorDefArray = &monitor;
-    UINT rrc = gfx->ResetGraphics(gfx, &reset);
-    if (rrc != CHANNEL_RC_OK) { rdp_error("ResetGraphics failed: %u", rrc); return rrc; }
-    rdp_verbose("GFX ResetGraphics: %ux%u, 1 monitor", w, h);
+    /* NOTE: we deliberately do NOT send RDPGFX_RESET_GRAPHICS. Field testing showed
+     * mstsc resets the connection ~10ms after receiving our RESET_GRAPHICS PDU
+     * (before any surface frame), whereas without it the session is stable. The
+     * surface is created at the full desktop size and mapped to output origin (0,0),
+     * which mstsc composites against the negotiated desktop dimensions directly.
+     * (The earlier black screen was the P-frame-before-keyframe bug, since fixed,
+     * not a missing canvas.) If multi-monitor support is added later, RESET_GRAPHICS
+     * will be needed — but the MONITOR_DEF format must be validated against mstsc. */
 
     RDPGFX_CREATE_SURFACE_PDU cs = {0};
     cs.surfaceId   = ctx->surfaceId;

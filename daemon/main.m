@@ -7,6 +7,7 @@
 #import <unistd.h>
 #import "daemon/RDPServer.h"
 #import "daemon/RDPSession.h"
+#import "daemon/AutoUpdate.h"
 #define RDP_LOG_COMPONENT "main"
 #include "logging/RDPLog.h"
 
@@ -79,8 +80,8 @@ int main(int argc, char *argv[]) {
         const char *env = getenv("RDP_LOG_LEVEL");
         if (env) { int l = rdp_log_level_from_string(env); if (l >= 0) rdp_log_set_level((RDPLogLevel)l); }
 
-        rdp_info("macos-rdp-daemon %s starting (log level: %s)",
-                 MACOS_RDP_VERSION,
+        rdp_info("macos-rdp-daemon %s (build %s) starting (log level: %s)",
+                 MACOS_RDP_VERSION, MACOS_RDP_BUILD_VERSION,
                  (const char *[]){"error","info","verbose","debug"}[rdp_log_get_level()]);
 
         /* Block SIGTERM/SIGINT at the signal level; catch via kqueue instead.
@@ -109,6 +110,11 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         rdp_info("listening on port %u", port);
+
+        /* Start the silent self-updater (no-op if RDP_UPDATE_ENABLED=0). It
+         * runs entirely on its own background serial queue + dispatch timer —
+         * it never touches the main thread (which is about to park in kevent). */
+        [AutoUpdate start];
 
         /* Spin the run loop on a background thread so CFRunLoop/dispatch works,
            while this thread blocks on kqueue — zero CPU until a signal arrives. */

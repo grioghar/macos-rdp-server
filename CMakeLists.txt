@@ -13,6 +13,25 @@ if(NOT CMAKE_OSX_ARCHITECTURES)
 endif()
 set(CMAKE_OSX_DEPLOYMENT_TARGET "14.0")
 
+# ── Build version stamping ────────────────────────────────────────────────
+# Stamp the binary with the short git SHA so the auto-updater can compare the
+# running version against the latest published release (whose tag == this SHA).
+# Falls back to a UTC timestamp, then "dev", when git is unavailable.
+# CI may override with -DMACOS_RDP_BUILD_VERSION=<sha> to guarantee the stamp
+# matches the release tag exactly.
+if(NOT MACOS_RDP_BUILD_VERSION)
+    execute_process(
+        COMMAND git rev-parse --short HEAD
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        OUTPUT_VARIABLE MACOS_RDP_BUILD_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET)
+endif()
+if(NOT MACOS_RDP_BUILD_VERSION)
+    string(TIMESTAMP MACOS_RDP_BUILD_VERSION "dev-%Y%m%d%H%M%S" UTC)
+endif()
+message(STATUS "macos-rdp-daemon build version: ${MACOS_RDP_BUILD_VERSION}")
+
 # ── Static vs dynamic FreeRDP ─────────────────────────────────────────────
 option(MACOS_RDP_STATIC
        "Link FreeRDP/WinPR as static libraries (used in CI release builds)"
@@ -63,6 +82,7 @@ add_executable(macos-rdp-daemon
     daemon/RDPSession.m
     daemon/Authenticator.m
     daemon/DisplayControl.m
+    daemon/AutoUpdate.m
     protocol/RDPPeer.c
     display/VirtualDisplay.m
     display/ScreenCapture.m
@@ -114,6 +134,7 @@ set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 # (no pillarbox / 1:1 input). Falls back to the main display if the private API fails.
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.6"
+    MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"
     MACOS_RDP_VIRTUAL_DISPLAY=1
 )
 

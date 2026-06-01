@@ -10,10 +10,15 @@ on:
     branches: [master]
   workflow_dispatch:
 
+permissions:
+  contents: write   # release job (push to master) needs this to create releases
+
 jobs:
   build-check:
     name: Compile check (arm64)
     runs-on: macos-14
+    outputs:
+      sha: ${{ steps.ver.outputs.sha }}
 
     steps:
       - name: Checkout
@@ -66,14 +71,22 @@ jobs:
           cmake --build "$SRC/build" --parallel "$(sysctl -n hw.logicalcpu)"
           cmake --install "$SRC/build"
 
+      - name: Compute build version (short SHA)
+        id: ver
+        run: echo "sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Compile macos-rdp-daemon
         run: |
           set -euo pipefail
+          # Stamp the binary with the short SHA so it equals the release tag the
+          # release job publishes below; a freshly-deployed build then reports
+          # "up to date" against its own release.
           cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
             -DMACOS_RDP_STATIC=ON \
+            -DMACOS_RDP_BUILD_VERSION="${{ steps.ver.outputs.sha }}" \
             -DFREERDP_STATIC_INSTALL="$HOME/freerdp-install" \
             -DCMAKE_PREFIX_PATH="$HOME/freerdp-install;$OPENSSL_ROOT" \
             -DOPENSSL_ROOT_DIR="$OPENSSL_ROOT" -DOPENSSL_USE_STATIC_LIBS=TRUE
@@ -103,3 +116,54 @@ jobs:
 
       - name: Compile menu-bar app
         run: ./gui/build.sh --compile-only
+
+  # ── Auto-update feed ──────────────────────────────────────────────────────
+  # On push to master only (NOT PRs), publish/refresh a GitHub Release tagged
+  # with the short SHA, carrying the freshly-built arm64 `macos-rdp-daemon`
+  # binary + a `macos-rdp-daemon.sha256` asset. The daemon's auto-updater polls
+  # releases/latest, compares tag_name to its stamped MACOS_RDP_BUILD_VERSION
+  # (== this SHA), and pulls when they differ. Idempotent: an existing tag is
+  # deleted and recreated so re-runs don't fail.
+  release-build:
+    name: Publish auto-update release
+    needs: build-check
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download arm64 binary artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-rdp-daemon-arm64
+          path: dist
+
+      - name: Prepare assets (sha256)
+        run: |
+          set -euo pipefail
+          chmod 755 dist/macos-rdp-daemon
+          # Bare 64-hex digest the daemon's regex/sha parser expects.
+          shasum -a 256 dist/macos-rdp-daemon | awk '{print $1}' > dist/macos-rdp-daemon.sha256
+          echo "sha256: $(cat dist/macos-rdp-daemon.sha256)"
+
+      - name: Publish release (tag = short SHA, marked latest)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.build-check.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Idempotent: drop any pre-existing release+tag for this SHA, then recreate.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG exists — deleting to recreate"
+            gh release delete "$TAG" --yes --cleanup-tag || true
+          fi
+          gh release create "$TAG" \
+            --title "macos-rdp-daemon build $TAG" \
+            --notes "Automated auto-update build for commit ${GITHUB_SHA}. sha256: $(cat dist/macos-rdp-daemon.sha256)" \
+            --latest \
+            --target "$GITHUB_SHA" \
+            dist/macos-rdp-daemon \
+            dist/macos-rdp-daemon.sha256

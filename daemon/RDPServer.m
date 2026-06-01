@@ -21,7 +21,21 @@
 @property (nonatomic, strong, nullable) RDPSession *activeSession;
 @end
 
+/* Process-wide active-session flag. The daemon runs a single RDPServer, so a
+ * class-level flag faithfully mirrors that instance's `_activeSession`. The
+ * auto-updater reads this (off any thread) to decide whether to defer a swap. */
+static volatile int32_t g_hasActiveSession = 0;
+
 @implementation RDPServer
+
++ (BOOL)hasActiveSession {
+    return g_hasActiveSession != 0;
+}
+
+- (void)updateActiveSessionFlag {
+    /* Caller holds @synchronized(self). */
+    g_hasActiveSession = (_activeSession != nil) ? 1 : 0;
+}
 
 - (instancetype)initWithPort:(uint16_t)port {
     if ((self = [super init])) {
@@ -130,6 +144,7 @@
         for (RDPSession *s in _sessions) [s disconnect];
         [_sessions removeAllObjects];
         _activeSession = nil;
+        [self updateActiveSessionFlag];
     }
 }
 
@@ -154,6 +169,7 @@
         /* Claim active immediately so a third concurrent client that authenticates
          * supersedes US in turn rather than racing on a stale pointer. */
         _activeSession = session;
+        [self updateActiveSessionFlag];
     }
 
     if (previous) {
@@ -182,6 +198,7 @@
         if (_activeSession != session) {
             rdp_info("session %s was superseded while activating — aborting",
                      session.clientAddress.UTF8String);
+            [self updateActiveSessionFlag];
             return NO;
         }
     }
@@ -192,6 +209,7 @@
     @synchronized(self) {
         [_sessions removeObject:session];
         if (_activeSession == session) _activeSession = nil;
+        [self updateActiveSessionFlag];
     }
     rdp_debug("session removed; %lu remaining", (unsigned long)_sessions.count);
     [self.delegate serverSession:session didEndWithError:error];

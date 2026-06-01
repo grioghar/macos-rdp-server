@@ -168,9 +168,9 @@ static void rdp_on_keyframe_request(void *ud) {
     CGDirectDisplayID displayID = _display ? _display.displayID : CGMainDisplayID();
 
     /* Wake the Mac + keep it awake for the whole session (replaces caffeinate),
-     * and privacy-blank the BUILT-IN display so a bystander can't watch the
-     * remote session. Pass the virtual display id so we never blank the screen
-     * the remote actually captures. RDP_SHARED_MODE=1 skips blanking. */
+     * and privacy-dim the BUILT-IN panel (brightness -> 0) so a bystander can't
+     * watch the remote session. Pass the virtual display id so we never dim the
+     * screen the remote actually captures. RDP_SHARED_MODE=1 skips dimming. */
     _displayControl = [[DisplayControl alloc] initWithVirtualDisplayID:displayID];
     [_displayControl start];
 

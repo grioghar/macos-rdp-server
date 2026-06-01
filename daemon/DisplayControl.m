@@ -1,6 +1,7 @@
 #import "daemon/DisplayControl.h"
 #import <CoreGraphics/CoreGraphics.h>
 #import <IOKit/pwr_mgt/IOPMLib.h>
+#import <dlfcn.h>
 #import <unistd.h>
 #define RDP_LOG_COMPONENT "displayctl"
 #include "logging/RDPLog.h"
@@ -13,22 +14,44 @@
  * dispatch global queue. There is therefore NO running main run loop and no
  * NSApplication event loop.
  *
- * Consequences for blanking:
- *   - A black NSWindow / NSScreenSaverWindowLevel overlay needs AppKit on the
- *     main thread AND a draining main run loop to actually composite and stay on
- *     top. Neither exists here, so an NSWindow overlay is unreliable headless.
- *   - CGDisplayCapture() + a fill of the captured display's drawing context is
- *     a pure CoreGraphics path: it does NOT need AppKit or any run loop. The
- *     capture itself raises the display above all normal windows (the shield),
- *     so a black fill is a true privacy blank. This is the strategy we use.
+ * BLANKING STRATEGY — panel brightness, NOT display capture
+ * ----------------------------------------------------------------------------
+ * Privacy "blanking" here means dimming the BUILT-IN physical panel to black by
+ * driving its backlight brightness to 0 via the private DisplayServices
+ * framework. This is a pure side-channel to the panel hardware: it does NOT
+ * change the display topology and does NOT trigger a WindowServer
+ * reconfiguration, so the virtual/remote display keeps compositing normally and
+ * the remote view is UNAFFECTED.
+ *
+ * This replaces the old CGDisplayCapture()+black-fill approach. Capturing a
+ * display raised a privacy shield BUT the capture caused a WindowServer
+ * reconfiguration that also stopped compositing to the virtual display, so the
+ * remote went all-black. We must never do that again — there is no fallback to
+ * CGDisplayCapture anywhere in this file.
+ *
+ * DisplayServices is a private framework. We resolve its two symbols at runtime
+ * with dlopen/dlsym (no hard link dependency); if the framework or symbols are
+ * unavailable on this hardware we log clearly and fall back to NO blanking —
+ * the remote keeps working and we never crash.
+ *
+ *   extern int DisplayServicesSetBrightness(CGDirectDisplayID, float);
+ *   extern int DisplayServicesGetBrightness(CGDirectDisplayID, float *);
+ *
+ * macOS single-session constraint: macOS has ONE GUI login session. This is
+ * privacy DIMMING of the local panel, not a true session lock — we can't show
+ * the login window locally while the remote keeps the unlocked desktop.
  *
  * Input monitoring uses a CGEventTap attached to the BACKGROUND run loop (the
  * one main.m already runs), so it works without the main thread. NSEvent global
  * monitors are avoided for the same run-loop reason.
  *
- * Everything here is best-effort: if blanking or the tap fails we log and keep
+ * Everything here is best-effort: if dimming or the tap fails we log and keep
  * going. Remote video is the priority; we must never crash the session.
  */
+
+/* DisplayServices private API signatures, resolved at runtime via dlsym. */
+typedef int (*DSSetBrightnessFn)(CGDirectDisplayID, float);
+typedef int (*DSGetBrightnessFn)(CGDirectDisplayID, float *);
 
 @interface DisplayControl ()
 @property (nonatomic, assign) CGDirectDisplayID virtualDisplayID;
@@ -39,9 +62,15 @@
 @property (nonatomic, assign) IOPMAssertionID displaySleepAssertion;
 @property (nonatomic, assign) IOPMAssertionID systemSleepAssertion;
 
-/* Blanking state. */
-@property (nonatomic, assign) BOOL displaysCaptured;
-@property (nonatomic, strong) NSArray<NSNumber *> *blankedDisplays;
+/* DisplayServices brightness control, resolved lazily at runtime. */
+@property (nonatomic, assign) void *displayServicesHandle;
+@property (nonatomic, assign) DSSetBrightnessFn dsSetBrightness;
+@property (nonatomic, assign) DSGetBrightnessFn dsGetBrightness;
+
+/* Blanking state: maps each dimmed built-in display id -> its saved brightness
+ * (to restore). Empty when nothing is dimmed. */
+@property (nonatomic, assign) BOOL displaysDimmed;
+@property (nonatomic, strong) NSMutableDictionary<NSNumber *, NSNumber *> *savedBrightness;
 
 /* Input monitor (CGEventTap on the background run loop). */
 @property (nonatomic, assign) CFMachPortRef eventTap;
@@ -51,7 +80,7 @@
 - (void)handleLocalUserActivity;
 @end
 
-/* CGEventTap callback: any physical interaction by the desk user un-blanks. */
+/* CGEventTap callback: any physical interaction by the desk user un-dims. */
 static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
                                    CGEventRef event, void *ud) {
     (void)proxy;
@@ -73,6 +102,7 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         _virtualDisplayID      = virtualDisplayID;
         _displaySleepAssertion = kIOPMNullAssertionID;
         _systemSleepAssertion  = kIOPMNullAssertionID;
+        _savedBrightness       = [NSMutableDictionary dictionary];
         const char *shared     = getenv("RDP_SHARED_MODE");
         _sharedMode            = (shared && strcmp(shared, "1") == 0);
     }
@@ -91,22 +121,13 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
         return;
     }
 
-    /* Privacy blanking is OPT-IN (RDP_PRIVACY_BLANK=1), default OFF.
-     * The CGDisplayCapture() approach blacks out the BUILT-IN, but capturing a
-     * display triggers a WindowServer reconfiguration that ALSO stops compositing
-     * to the virtual/remote display — the remote went all-black (frames still flow,
-     * but they are black). Until blanking is reimplemented non-disruptively (e.g.
-     * panel brightness -> 0 without a display-config change), it stays disabled so
-     * the remote view always works. Wake-on-connect power assertions above are
-     * unaffected and remain active. */
-    const char *blank = getenv("RDP_PRIVACY_BLANK");
-    if (!(blank && strcmp(blank, "1") == 0)) {
-        rdp_info("privacy blanking OFF (default; set RDP_PRIVACY_BLANK=1 to opt in — "
-                 "note: current method blacks the remote, rework pending)");
-        return;
-    }
-    rdp_info("RDP_PRIVACY_BLANK=1 — blanking built-in (may disrupt the remote view)");
-    [self blankBuiltInDisplays];
+    /* Privacy DIMMING is the DEFAULT. We drive the built-in panel brightness to
+     * 0 (a pure backlight change) so a bystander at the Mac can't watch the
+     * remote session. This does NOT change the display topology, so the
+     * virtual/remote display keeps compositing — the remote view is unaffected.
+     * Set RDP_SHARED_MODE=1 to skip dimming entirely. If brightness control is
+     * unavailable we fall back to NO dimming (never the old capture path). */
+    [self dimBuiltInDisplays];
     [self installInputMonitor];
 }
 
@@ -115,8 +136,9 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
     _started = NO;
 
     [self removeInputMonitor];
-    [self unblankDisplays];
+    [self undimDisplays];
     [self releasePowerAssertions];
+    [self closeDisplayServices];
     rdp_verbose("display control stopped");
 }
 
@@ -173,95 +195,143 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
     }
 }
 
-#pragma mark - Privacy blanking of the built-in display
+#pragma mark - DisplayServices (private) brightness control
 
-/* Enumerate active displays, capture every BUILT-IN one that is not the virtual
- * display, and fill it black. CGDisplayCapture raises the display above normal
- * windows and gives us an exclusive drawing context — a true privacy shield
- * that needs no AppKit run loop. */
-- (void)blankBuiltInDisplays {
+/* Resolve DisplayServicesSet/GetBrightness lazily via dlopen+dlsym. Returns YES
+ * if both symbols are available. We deliberately do NOT hard-link the private
+ * framework: if it's missing or renamed on some macOS build we simply skip
+ * dimming instead of failing to launch. */
+- (BOOL)ensureDisplayServices {
+    if (_dsSetBrightness && _dsGetBrightness) return YES;
+
+    if (!_displayServicesHandle) {
+        _displayServicesHandle = dlopen(
+            "/System/Library/PrivateFrameworks/DisplayServices.framework/DisplayServices",
+            RTLD_LAZY | RTLD_LOCAL);
+        if (!_displayServicesHandle) {
+            const char *e = dlerror();
+            rdp_error("DisplayServices unavailable (dlopen: %s) — privacy dimming "
+                      "DISABLED, remote unaffected", e ? e : "unknown");
+            return NO;
+        }
+    }
+
+    _dsSetBrightness = (DSSetBrightnessFn)dlsym(_displayServicesHandle,
+                                                "DisplayServicesSetBrightness");
+    _dsGetBrightness = (DSGetBrightnessFn)dlsym(_displayServicesHandle,
+                                                "DisplayServicesGetBrightness");
+    if (!_dsSetBrightness || !_dsGetBrightness) {
+        rdp_error("DisplayServices brightness symbols missing (set=%p get=%p) — "
+                  "privacy dimming DISABLED, remote unaffected",
+                  (void *)_dsSetBrightness, (void *)_dsGetBrightness);
+        _dsSetBrightness = NULL;
+        _dsGetBrightness = NULL;
+        return NO;
+    }
+    return YES;
+}
+
+- (void)closeDisplayServices {
+    _dsSetBrightness = NULL;
+    _dsGetBrightness = NULL;
+    if (_displayServicesHandle) {
+        dlclose(_displayServicesHandle);
+        _displayServicesHandle = NULL;
+    }
+}
+
+#pragma mark - Privacy dimming of the built-in display
+
+/* Enumerate active displays and dim every BUILT-IN one that is not the virtual
+ * display to brightness 0. This is a backlight change only — no display-config
+ * change — so the virtual/remote display keeps compositing normally. The
+ * original brightness of each affected display is saved for restore. */
+- (void)dimBuiltInDisplays {
+    if (![self ensureDisplayServices]) {
+        rdp_info("privacy dimming skipped — DisplayServices brightness control "
+                 "unavailable on this hardware; remote view works normally");
+        return;
+    }
+
     CGDirectDisplayID active[16];
     uint32_t count = 0;
     CGError ce = CGGetActiveDisplayList(16, active, &count);
     if (ce != kCGErrorSuccess) {
-        rdp_error("CGGetActiveDisplayList failed (%d) — cannot blank, continuing", ce);
+        rdp_error("CGGetActiveDisplayList failed (%d) — cannot dim, continuing", ce);
         return;
     }
 
-    NSMutableArray<NSNumber *> *blanked = [NSMutableArray array];
     for (uint32_t i = 0; i < count; i++) {
         CGDirectDisplayID did = active[i];
         if (did == _virtualDisplayID) {
-            rdp_verbose("display %u is the virtual/remote display — left visible", did);
+            rdp_verbose("display %u is the virtual/remote display — left lit", did);
             continue;
         }
-        /* Only blank the physical built-in panel(s); leave any extra external
-         * monitors alone (they may be the desk user's, but more importantly we
-         * must never accidentally blank the one the remote captures). */
+        /* Only dim the physical built-in panel(s); leave any external monitors
+         * alone, and never touch the display the remote captures. */
         if (!CGDisplayIsBuiltin(did)) {
-            rdp_verbose("display %u is not built-in — left visible", did);
+            rdp_verbose("display %u is not built-in — left lit", did);
             continue;
         }
 
-        CGError cap = CGDisplayCapture(did);
-        if (cap != kCGErrorSuccess) {
-            rdp_error("CGDisplayCapture(%u) failed (%d) — display NOT blanked", did, cap);
+        /* Save the current brightness so we can restore it later. */
+        float original = 1.0f;
+        int gr = _dsGetBrightness(did, &original);
+        if (gr != 0) {
+            rdp_error("DisplayServicesGetBrightness(%u) failed (%d) — "
+                      "display NOT dimmed (can't safely restore)", did, gr);
             continue;
         }
-        [self fillCapturedDisplayBlack:did];
-        [blanked addObject:@(did)];
-        rdp_info("privacy-blanked built-in display %u", did);
+
+        int sr = _dsSetBrightness(did, 0.0f);
+        if (sr != 0) {
+            rdp_error("DisplayServicesSetBrightness(%u, 0) failed (%d) — "
+                      "display NOT dimmed", did, sr);
+            continue;
+        }
+
+        _savedBrightness[@(did)] = @(original);
+        rdp_info("privacy-dimmed built-in display %u (brightness %.2f -> 0)",
+                 did, original);
     }
 
-    if (blanked.count == 0) {
-        rdp_info("no built-in display to blank (only the virtual/remote display "
-                 "is active) — nothing to do");
+    if (_savedBrightness.count == 0) {
+        rdp_info("no built-in display to dim (only the virtual/remote display "
+                 "is active, or none accepted brightness control) — nothing to do");
         return;
     }
-    _blankedDisplays  = blanked;
-    _displaysCaptured = YES;
+    _displaysDimmed = YES;
 }
 
-- (void)fillCapturedDisplayBlack:(CGDirectDisplayID)did {
-    /* The captured display gives us an exclusive CG drawing context we can fill
-     * with opaque black. Available only while the display is captured. */
-    CGContextRef ctx = CGDisplayGetDrawingContext(did);
-    if (!ctx) {
-        rdp_error("no drawing context for captured display %u — leaving as-is", did);
-        return;
-    }
-    size_t w = CGDisplayPixelsWide(did);
-    size_t h = CGDisplayPixelsHigh(did);
-    CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
-    CGContextFillRect(ctx, CGRectMake(0, 0, (CGFloat)w, (CGFloat)h));
-    CGContextFlush(ctx);
-}
+/* Restore every dimmed display to its saved brightness. */
+- (void)undimDisplays {
+    if (!_displaysDimmed) return;
 
-- (void)unblankDisplays {
-    if (!_displaysCaptured) return;
-    for (NSNumber *n in _blankedDisplays) {
-        CGDirectDisplayID did = (CGDirectDisplayID)n.unsignedIntValue;
-        CGError rc = CGDisplayRelease(did);
-        if (rc == kCGErrorSuccess)
-            rdp_info("released privacy blank on display %u", did);
-        else
-            rdp_error("CGDisplayRelease(%u) failed (%d)", did, rc);
+    for (NSNumber *key in _savedBrightness) {
+        CGDirectDisplayID did = (CGDirectDisplayID)key.unsignedIntValue;
+        float original = _savedBrightness[key].floatValue;
+        if (_dsSetBrightness) {
+            int sr = _dsSetBrightness(did, original);
+            if (sr == 0)
+                rdp_info("restored brightness %.2f on display %u", original, did);
+            else
+                rdp_error("DisplayServicesSetBrightness(%u, %.2f) restore failed (%d)",
+                          did, original, sr);
+        }
     }
-    /* Belt-and-suspenders: release any displays still captured by this process. */
-    CGReleaseAllDisplays();
-    _blankedDisplays  = nil;
-    _displaysCaptured = NO;
+    [_savedBrightness removeAllObjects];
+    _displaysDimmed = NO;
 }
 
 #pragma mark - Return control to the local user
 
-/* Re-blank policy: once the desk user physically interacts we hand the screen
- * back and DO NOT re-blank for the rest of this session. Rationale: re-blanking
- * under the user's hands would fight an actively-present person at the keyboard,
- * which is worse than the small privacy window of a present, deliberate user.
- * Privacy is fully restored on the next session connect. */
+/* Re-dim policy: once the desk user physically interacts we restore brightness
+ * and DO NOT re-dim for the rest of this session. Rationale: re-dimming under
+ * the user's hands would fight an actively-present person at the keyboard, which
+ * is worse than the small privacy window of a present, deliberate user. Privacy
+ * is fully restored on the next session connect. */
 - (void)installInputMonitor {
-    if (!_displaysCaptured) return;   /* nothing to give back */
+    if (!_displaysDimmed) return;   /* nothing to give back */
 
     CGEventMask mask = CGEventMaskBit(kCGEventMouseMoved)   |
                        CGEventMaskBit(kCGEventLeftMouseDown) |
@@ -275,8 +345,8 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
                                          kCGEventTapOptionListenOnly, mask,
                                          rdp_event_tap_cb, (__bridge void *)self);
     if (!tap) {
-        rdp_error("CGEventTapCreate failed — desk user cannot auto-reclaim screen "
-                  "(needs Accessibility/Input Monitoring). Blank stays until disconnect.");
+        rdp_error("CGEventTapCreate failed — desk user cannot auto-restore brightness "
+                  "(needs Accessibility/Input Monitoring). Dim stays until disconnect.");
         return;
     }
     CFRunLoopSourceRef src = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0);
@@ -312,10 +382,10 @@ static CGEventRef rdp_event_tap_cb(CGEventTapProxy proxy, CGEventType type,
 }
 
 - (void)handleLocalUserActivity {
-    if (!_displaysCaptured) return;   /* already handed back */
-    rdp_info("local user activity detected — returning the screen to the desk user");
-    [self unblankDisplays];
-    /* Tear down the tap; we won't re-blank this session. */
+    if (!_displaysDimmed) return;   /* already handed back */
+    rdp_info("local user activity detected — restoring the screen to the desk user");
+    [self undimDisplays];
+    /* Tear down the tap; we won't re-dim this session. */
     [self removeInputMonitor];
 }
 

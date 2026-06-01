@@ -15,6 +15,10 @@
 @property (nonatomic, strong) NSMutableArray<RDPSession *> *sessions;
 @property (nonatomic, strong) dispatch_source_t acceptSource;
 @property (nonatomic, strong) dispatch_queue_t acceptQueue;
+/* The single active (authenticated) session that owns the display. Guarded by
+ * @synchronized(self) along with `sessions`. A new client that authenticates
+ * supersedes whatever is here. */
+@property (nonatomic, strong, nullable) RDPSession *activeSession;
 @end
 
 @implementation RDPServer
@@ -125,11 +129,70 @@
         rdp_verbose("disconnecting %lu active sessions", (unsigned long)_sessions.count);
         for (RDPSession *s in _sessions) [s disconnect];
         [_sessions removeAllObjects];
+        _activeSession = nil;
     }
 }
 
+/* A session authenticated its client and wants to own the display. Make it the
+ * single active session, superseding (disconnecting + waiting on the teardown
+ * of) any session currently active. Called on the NEW session's serial queue;
+ * the blocking wait happens off-lock so concurrent connection attempts don't
+ * stall. Returns NO if the server is stopping. */
+- (BOOL)sessionDidAuthenticateAndRequestActivation:(RDPSession *)session {
+    if (!_running) {
+        rdp_info("activation refused: server is stopping");
+        return NO;
+    }
+
+    RDPSession *previous = nil;
+    @synchronized(self) {
+        previous = _activeSession;
+        if (previous == session) {
+            rdp_verbose("session %s already active", session.clientAddress.UTF8String);
+            return YES;
+        }
+        /* Claim active immediately so a third concurrent client that authenticates
+         * supersedes US in turn rather than racing on a stale pointer. */
+        _activeSession = session;
+    }
+
+    if (previous) {
+        rdp_info("TAKEOVER: %s superseding active session %s",
+                 session.clientAddress.UTF8String,
+                 previous.clientAddress.UTF8String);
+        /* Tell the old session to exit its peer loop + tear down (releases its
+         * virtual display + display assertions), then block until it has done so
+         * BEFORE we let the new session create its own virtual display — two live
+         * virtual displays would both map to the main display and fight. */
+        [previous disconnect];
+        if (![previous waitForTeardown:10.0])
+            rdp_error("TAKEOVER: previous session %s did not tear down in time — "
+                      "proceeding anyway (display may briefly conflict)",
+                      previous.clientAddress.UTF8String);
+        else
+            rdp_info("TAKEOVER: previous session %s released the display",
+                     previous.clientAddress.UTF8String);
+    } else {
+        rdp_info("session %s is now the active session (no prior session)",
+                 session.clientAddress.UTF8String);
+    }
+
+    /* If a still-newer client superseded us while we waited, abort. */
+    @synchronized(self) {
+        if (_activeSession != session) {
+            rdp_info("session %s was superseded while activating — aborting",
+                     session.clientAddress.UTF8String);
+            return NO;
+        }
+    }
+    return YES;
+}
+
 - (void)sessionDidEnd:(RDPSession *)session error:(NSError *)error {
-    @synchronized(self) { [_sessions removeObject:session]; }
+    @synchronized(self) {
+        [_sessions removeObject:session];
+        if (_activeSession == session) _activeSession = nil;
+    }
     rdp_debug("session removed; %lu remaining", (unsigned long)_sessions.count);
     [self.delegate serverSession:session didEndWithError:error];
 }

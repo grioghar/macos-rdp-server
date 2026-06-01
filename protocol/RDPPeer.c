@@ -662,9 +662,41 @@ static BOOL peer_activate(freerdp_peer *peer) {
     UINT32 h = freerdp_settings_get_uint32(s, FreeRDP_DesktopHeight);
     UINT32 d = freerdp_settings_get_uint32(s, FreeRDP_ColorDepth);
     rdp_info("peer activated: %ux%u @%ubpp", w, h, d);
+
+    /* Capture the logon credentials the client sent in the RDP info packet. NLA
+     * is OFF (our OpenSSL build lacks md4/NTLM), so mstsc transmits them here in
+     * the TLS-protected RDP logon. The session layer validates them against the
+     * local macOS account (Authenticator) before granting/taking over a session.
+     * NEVER log the password. Username/Domain are safe to log. */
+    const char *user   = freerdp_settings_get_string(s, FreeRDP_Username);
+    const char *domain = freerdp_settings_get_string(s, FreeRDP_Domain);
+    rdp_info("logon credentials received: user=%s domain=%s (password %s)",
+             user ? user : "(none)", domain ? domain : "(none)",
+             freerdp_settings_get_string(s, FreeRDP_Password) ? "present" : "absent");
+
     if (ctx->callbacks.onReady)
         ctx->callbacks.onReady(ctx->callbacks.userdata, w, h, d);
     return TRUE;
+}
+
+/* Read the client's logon credentials from the negotiated peer settings. Valid
+ * after peer_activate has run (Activate / onReady). The returned pointers are
+ * owned by FreeRDP settings and live as long as the peer; any may be NULL when
+ * the client supplied no value. NEVER log *password. */
+void rdp_peer_get_credentials(freerdp_peer *peer,
+                              const char **username,
+                              const char **password,
+                              const char **domain) {
+    const char *u = NULL, *p = NULL, *dm = NULL;
+    if (peer && peer->context) {
+        rdpSettings *s = peer->context->settings;
+        u  = freerdp_settings_get_string(s, FreeRDP_Username);
+        p  = freerdp_settings_get_string(s, FreeRDP_Password);
+        dm = freerdp_settings_get_string(s, FreeRDP_Domain);
+    }
+    if (username) *username = u;
+    if (password) *password = p;
+    if (domain)   *domain   = dm;
 }
 
 /* ── Public API ────────────────────────────────────────────────────────── */

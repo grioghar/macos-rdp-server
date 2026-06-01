@@ -61,6 +61,7 @@ add_executable(macos-rdp-daemon
     daemon/main.m
     daemon/RDPServer.m
     daemon/RDPSession.m
+    daemon/Authenticator.m
     daemon/DisplayControl.m
     protocol/RDPPeer.c
     display/VirtualDisplay.m
@@ -93,6 +94,7 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework AudioToolbox"
     "-framework AppKit"
     "-framework ApplicationServices"
+    "-framework OpenDirectory"
     "-framework IOKit"
     "-framework IOSurface"
     "-framework Security"

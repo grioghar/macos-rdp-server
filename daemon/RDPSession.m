@@ -1,5 +1,6 @@
 #import "daemon/RDPSession.h"
 #import "daemon/DisplayControl.h"
+#import "daemon/Authenticator.h"
 #import "protocol/RDPPeer.h"
 #import "display/VirtualDisplay.h"
 #import "display/ScreenCapture.h"
@@ -32,6 +33,13 @@ static const uint32_t kDefaultBitrate = 8000;
 @property (nonatomic, strong) AudioCapture    *audio;
 @property (nonatomic, strong) CursorCapture   *cursor;
 @property (nonatomic, strong) dispatch_queue_t sessionQueue;
+/* Signaled exactly once when teardown completes; lets the takeover path wait
+ * for this session's display to be released without touching the main queue. */
+@property (nonatomic, strong) dispatch_semaphore_t teardownSem;
+/* Set once this session has authenticated + become the active session, so we
+ * skip re-authenticating / re-activating on a subsequent Activate (mstsc may
+ * re-activate on a resize). Guarded by the serial session queue. */
+@property (nonatomic, assign) BOOL activated;
 @end
 
 @implementation RDPSession
@@ -43,6 +51,7 @@ static const uint32_t kDefaultBitrate = 8000;
         _sessionState   = RDPSessionStateConnecting;
         _sessionQueue   = dispatch_queue_create("com.macosrdp.session",
                                                 DISPATCH_QUEUE_SERIAL);
+        _teardownSem    = dispatch_semaphore_create(0);
     }
     return self;
 }
@@ -152,6 +161,49 @@ static void rdp_on_keyframe_request(void *ud) {
 }
 
 - (void)setupDisplayAndMediaForWidth:(uint32_t)w height:(uint32_t)h {
+    /* mstsc can re-activate (e.g. on a client-side resize). We only authenticate
+     * and bring the display up once — re-entry after we're active is a no-op. */
+    if (_activated || _sessionState == RDPSessionStateActive) {
+        rdp_verbose("re-activation ignored (session already active) for %s",
+                    _address.UTF8String);
+        return;
+    }
+
+    /* ── Authenticate BEFORE creating any virtual display ─────────────────────
+     * Credentials arrived in the RDP logon (peer_activate captured them). Validate
+     * against the local macOS account. Fail-closed: bad/missing creds → tear the
+     * connection down. This runs inline on the serial session queue (inside the
+     * peer loop), so a synchronous check is safe. NEVER log the password. */
+    const char *cuser = NULL, *cpass = NULL, *cdomain = NULL;
+    rdp_peer_get_credentials(_peer, &cuser, &cpass, &cdomain);
+    NSString *user   = cuser   ? [NSString stringWithUTF8String:cuser]   : nil;
+    NSString *pass   = cpass   ? [NSString stringWithUTF8String:cpass]   : nil;
+    NSString *domain = cdomain ? [NSString stringWithUTF8String:cdomain] : nil;
+
+    if (![Authenticator validateUsername:user password:pass domain:domain]) {
+        rdp_error("authentication FAILED for %s (user='%s') — rejecting connection",
+                  _address.UTF8String, user.length ? user.UTF8String : "(none)");
+        _sessionState = RDPSessionStateDisconnecting;
+        return;  /* peer loop sees Disconnecting and exits → teardown, no display */
+    }
+    rdp_info("authentication OK for %s (user='%s')",
+             _address.UTF8String, user.length ? user.UTF8String : "(none)");
+
+    /* ── Become the single active session (takeover) ──────────────────────────
+     * Ask the server to make us active. It signals any currently-active session
+     * to disconnect and BLOCKS here until that old session has released its
+     * virtual display, so we never have two virtual displays / two main displays
+     * fighting. If it returns NO we were superseded (or the server is stopping)
+     * and must abort. */
+    if ([self.delegate respondsToSelector:@selector(sessionDidAuthenticateAndRequestActivation:)]) {
+        if (![self.delegate sessionDidAuthenticateAndRequestActivation:self]) {
+            rdp_info("activation refused for %s — aborting session", _address.UTF8String);
+            _sessionState = RDPSessionStateDisconnecting;
+            return;
+        }
+    }
+    _activated = YES;
+
     uint32_t width  = w  ?: kDefaultWidth;
     uint32_t height = h ?: kDefaultHeight;
 
@@ -269,7 +321,19 @@ static void rdp_on_keyframe_request(void *ud) {
 
 - (void)disconnect {
     rdp_info("disconnecting %s", _address.UTF8String);
+    /* The peer loop polls this state every <=50ms and exits when it sees
+     * Disconnecting, after which teardown runs on the session queue. */
     _sessionState = RDPSessionStateDisconnecting;
+}
+
+- (BOOL)waitForTeardown:(NSTimeInterval)timeout {
+    dispatch_time_t deadline = dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)(timeout * NSEC_PER_SEC));
+    long rc = dispatch_semaphore_wait(_teardownSem, deadline);
+    if (rc != 0)
+        rdp_error("timed out after %.0fs waiting for %s to release its display",
+                  timeout, _address.UTF8String);
+    return rc == 0;
 }
 
 - (void)teardown {
@@ -287,11 +351,21 @@ static void rdp_on_keyframe_request(void *ud) {
 
     _sessionState = RDPSessionStateDisconnected;
     rdp_info("session torn down for %s", _address.UTF8String);
+
+    /* Signal anyone waiting on takeover that our display is now released. Done
+     * here (on the session queue, after destroy) rather than via the main-queue
+     * delegate hop below — the main run loop does not run in this daemon, so the
+     * semaphore is the reliable cross-thread completion signal. */
+    dispatch_semaphore_signal(_teardownSem);
+
     [self endWithError:nil];
 }
 
 - (void)endWithError:(NSError *)error {
-    dispatch_async(dispatch_get_main_queue(), ^{
+    /* Notify on a background queue, NOT the main queue: this daemon's main thread
+     * blocks in kevent() with no running main run loop, so a main-queue async
+     * would never fire and the server would never remove this session. */
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
         [self.delegate sessionDidEnd:self error:error];
     });
 }

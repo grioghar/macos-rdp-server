@@ -74,6 +74,16 @@ freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks);
 void          rdp_peer_destroy(freerdp_peer *peer);
 bool          rdp_peer_run_once(freerdp_peer *peer);
 
+/* Read the logon credentials the client supplied in the RDP info packet (valid
+ * once the peer has activated — i.e. inside/after the onReady callback). The
+ * out-pointers receive pointers OWNED by the FreeRDP peer settings (do not free;
+ * valid for the peer's lifetime). Any out value may be NULL if the client sent
+ * none. Pass NULL for fields you don't need. NEVER log the returned password. */
+void rdp_peer_get_credentials(freerdp_peer *peer,
+                              const char **username,
+                              const char **password,
+                              const char **domain);
+
 /*
  * Send an AVC420 (H.264) frame.
  *

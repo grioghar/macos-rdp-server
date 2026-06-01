@@ -3,6 +3,8 @@
 #import <Foundation/Foundation.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <unistd.h>
+#import <stdlib.h>
+#import <sys/stat.h>
 #define RDP_LOG_COMPONENT "update"
 #include "logging/RDPLog.h"
 

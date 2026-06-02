@@ -12,8 +12,12 @@ struct AgentController {
 
     // MARK: Configuration constants
 
-    /// Service label as written by scripts/install-user.sh.
-    static let label = "com.macosrdp.agent"
+    /// Service label used by the live per-user LaunchAgent (the label in
+    /// ~/Library/LaunchAgents/com.macosrdp.agent.user.plist and registered
+    /// under gui/<uid>/com.macosrdp.agent.user by launchctl bootstrap).
+    /// NOTE: scripts/install-user.sh historically used "com.macosrdp.agent" —
+    /// that is the discrepancy to reconcile; the live deploy uses .agent.user.
+    static let label = "com.macosrdp.agent.user"
 
     /// LaunchAgent plist path for the current user.
     static var plistPath: String {

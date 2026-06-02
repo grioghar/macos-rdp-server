@@ -68,6 +68,13 @@ struct rdp_peer_context {
      * advertised a Format List (Win->Mac paste). The matching ClientFormatDataResponse
      * carries no format id of its own, so we remember what we requested. */
     uint32_t             clipReqFormat;
+    /* cliprdr handshake complete (client sent its Capabilities/Format List). The
+     * Mac->Win advertise (ServerFormatList, called from the clipboard POLL thread)
+     * MUST NOT run before this — sending a Format List before the channel's send
+     * state is initialized corrupts FreeRDP's cliprdr stream and aborts the daemon
+     * (WinPR Stream_Write_UINT32 assert). Set true in the client caps/format-list
+     * callbacks; gates rdp_peer_send_clipboard. */
+    bool                 clipReady;
 };
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks);

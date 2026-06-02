@@ -235,7 +235,9 @@ static UINT gfx_caps_advertise(RdpgfxServerContext *gfx,
  * flags (e.g. useLongFormatNames) onto the context. */
 static UINT cliprdr_client_capabilities(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_CAPABILITIES *caps) {
-    (void)cliprdr;
+    RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
+    /* Client engaged the channel — it is now safe to advertise (ServerFormatList). */
+    if (ctx) ctx->clipReady = true;
     UINT32 flags = 0, version = 0;
     for (UINT32 i = 0; i < caps->cCapabilitiesSets; i++) {
         const CLIPRDR_CAPABILITY_SET *set = &caps->capabilitySets[i];
@@ -272,6 +274,7 @@ static UINT cliprdr_client_format_list_response(
 static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                                         const CLIPRDR_FORMAT_LIST *list) {
     RDPPeerContext *ctx = (RDPPeerContext *)cliprdr->custom;
+    ctx->clipReady = true;   /* channel fully engaged — Mac->Win advertise is safe */
     rdp_verbose("clipboard: <- ClientFormatList (%u formats)", list->numFormats);
     for (UINT32 i = 0; i < list->numFormats; i++)
         rdp_verbose("clipboard:    format[%u] id=0x%08x name=%s", i,
@@ -1155,6 +1158,16 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     memcpy(ctx->clipData, data, len);
     ctx->clipLen    = len;
     ctx->clipFormat = format;
+
+    /* Hold the data but DO NOT advertise until the cliprdr handshake is complete.
+     * Calling ServerFormatList before the client has engaged the channel corrupts
+     * FreeRDP's cliprdr send stream and aborts the daemon (the crash-loop that gave
+     * the client 0x904). Once ready, the next pasteboard change re-advertises. */
+    if (!ctx->clipReady) {
+        rdp_verbose("clipboard: held %zu bytes (fmt 0x%08x) — channel not ready, "
+                    "advertise deferred", len, format);
+        return true;
+    }
 
     /* Advertise the available format; the client requests the bytes on paste.
      *

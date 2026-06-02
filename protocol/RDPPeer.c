@@ -60,7 +60,7 @@
 /* IRP_MJ_QUERY_INFORMATION information classes — prefixed to avoid collision
  * with WinPR ntioapi.h which may define RDPDR_FileStandardInformation = 5 etc. */
 #define RDPDR_FileBasicInformation       0x00000004  /* timestamps + attrs */
-#define RDPDR_RDPDR_FileStandardInformation    0x00000005  /* size + allocation */
+#define RDPDR_FileStandardInformation    0x00000005  /* size + allocation */
 
 /* NTSTATUS codes relevant to RDPDR — prefixed to avoid redefinition if WinPR
  * defines the generic STATUS_SUCCESS in its ntstatus.h. */

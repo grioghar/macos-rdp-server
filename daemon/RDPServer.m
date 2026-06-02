@@ -7,6 +7,7 @@
 #import <unistd.h>
 #define RDP_LOG_COMPONENT "server"
 #include "logging/RDPLog.h"
+#include <stdatomic.h>
 
 @interface RDPServer () <RDPSessionDelegate>
 @property (nonatomic, assign) int listenFd;
@@ -24,17 +25,23 @@
 /* Process-wide active-session flag. The daemon runs a single RDPServer, so a
  * class-level flag faithfully mirrors that instance's `_activeSession`. The
  * auto-updater reads this (off any thread) to decide whether to defer a swap. */
-static volatile int32_t g_hasActiveSession = 0;
+/* Previously volatile int32_t: volatile prevents register caching but not
+ * CPU reordering — readers on other cores could see stale values.
+ * _Atomic with acquire/release gives the correct happens-before guarantee. */
+static _Atomic int32_t g_hasActiveSession = 0;
 
 @implementation RDPServer
 
 + (BOOL)hasActiveSession {
-    return g_hasActiveSession != 0;
+    return atomic_load_explicit(&g_hasActiveSession, memory_order_acquire) != 0;
 }
 
 - (void)updateActiveSessionFlag {
-    /* Caller holds @synchronized(self). */
-    g_hasActiveSession = (_activeSession != nil) ? 1 : 0;
+    /* Caller holds @synchronized(self); the store pairs with the acquire load
+     * in +hasActiveSession to form a proper happens-before edge. */
+    atomic_store_explicit(&g_hasActiveSession,
+                          (_activeSession != nil) ? 1 : 0,
+                          memory_order_release);
 }
 
 - (instancetype)initWithPort:(uint16_t)port {

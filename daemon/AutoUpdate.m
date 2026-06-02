@@ -427,9 +427,11 @@ static NSString *signKeychain(void) {
 /* ── sha256 helpers ───────────────────────────────────────────────────── */
 - (NSString *)firstSha256InString:(NSString *)s {
     if (![s isKindOfClass:[NSString class]]) return nil;
-    /* A .sha256 file is typically "<64hex>  filename". Grab the first 64-hex run. */
     NSError *e = nil;
-    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"[0-9a-fA-F]{64}"
+    /* Require exact 64-hex word (not part of a longer hex string). The
+     * negative lookahead/lookbehind ensures we do not match a substring
+     * of a 128-char hex run (e.g. two SHA-256 values concatenated). */
+    NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])"
                                                                        options:0 error:&e];
     if (!re) return nil;
     NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];

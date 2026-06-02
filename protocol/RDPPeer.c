@@ -1522,6 +1522,12 @@ bool rdp_peer_open_rdpdr(freerdp_peer *peer) {
     return true;
 }
 
+/* Maximum PDU size for a static virtual channel. The RDP spec limits static
+ * VC PDUs to CHANNEL_CHUNK_LENGTH (1600) per write, and rdpdr PDUs are
+ * small (handshake packets < 100 bytes; device list < 512 bytes). 4096
+ * gives comfortable headroom for a list of many devices. */
+#define RDPDR_READ_BUF_SIZE 4096
+
 /*
  * Drain all pending inbound PDUs from the rdpdr channel and advance the
  * MS-RDPEFS handshake state machine. Called from the peer run loop under
@@ -1531,13 +1537,14 @@ void rdp_peer_pump_rdpdr(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
     if (!ctx->rdpdrChannel || ctx->rdpdrState == kRdpdrError) return;
 
-    for (;;) {
-        PCHAR buf = NULL;
-        ULONG len = 0;
-        /* timeout=0: non-blocking read; returns FALSE with no data available. */
-        if (!WTSVirtualChannelRead(ctx->rdpdrChannel, 0, &buf, &len)) break;
-        if (!buf || len == 0) { if (buf) WTSFreeMemory(buf); break; }
-        rdpdr_handle_pdu(ctx, (BYTE *)buf, len);
-        WTSFreeMemory(buf);
+    /* WTSVirtualChannelRead(handle, timeout_ms, buf, bufSize, &bytesRead).
+     * timeout=0 → non-blocking; returns FALSE when no data is pending. */
+    BYTE  buf[RDPDR_READ_BUF_SIZE];
+    ULONG bytesRead = 0;
+    while (WTSVirtualChannelRead(ctx->rdpdrChannel, 0,
+                                  (PCHAR)buf, (ULONG)sizeof(buf), &bytesRead)
+           && bytesRead > 0) {
+        rdpdr_handle_pdu(ctx, buf, bytesRead);
+        bytesRead = 0;
     }
 }

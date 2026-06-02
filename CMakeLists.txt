@@ -84,6 +84,7 @@ add_executable(macos-rdp-daemon
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
     protocol/RDPPeer.c
+    protocol/RDPDriveMount.m
     display/VirtualDisplay.m
     display/ScreenCapture.m
     display/FrameEncoder.m

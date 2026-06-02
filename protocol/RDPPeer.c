@@ -32,6 +32,7 @@
 #define PAKID_CORE_CLIENT_ANNOUNCE_REPLY 0x4352
 #define PAKID_CORE_DEVICE_LIST_ANNOUNCE  0x4441
 #define PAKID_CORE_DEVICE_REPLY          0x6472
+#define PAKID_CORE_DEVICE_IOCOMPLETION   0x4943   /* IRP I/O completion from client */
 #define RDPDR_DTYP_FILESYSTEM            0x00000008
 #define RDPDR_DTYP_PRINT                 0x00000004
 #define RDPDR_DTYP_SERIAL                0x00000001
@@ -40,6 +41,31 @@
 #define CAP_GENERAL_TYPE                 0x0001
 #define RDPDR_VERSION_MAJOR              0x0001
 #define RDPDR_VERSION_MINOR              0x000C
+
+/* IRP major function codes (MS-RDPEFS §2.2.1.4) — guard against WinPR
+ * redefinition (winpr/ntdef.h or similar may define these). */
+#ifndef IRP_MJ_CREATE
+#define IRP_MJ_CREATE                    0x00000000
+#endif
+#ifndef IRP_MJ_CLOSE
+#define IRP_MJ_CLOSE                     0x00000002
+#endif
+#ifndef IRP_MJ_QUERY_INFORMATION
+#define IRP_MJ_QUERY_INFORMATION         0x00000005
+#endif
+#ifndef IRP_MJ_DIRECTORY_CONTROL
+#define IRP_MJ_DIRECTORY_CONTROL         0x0000000C
+#endif
+
+/* IRP_MJ_QUERY_INFORMATION information classes — prefixed to avoid collision
+ * with WinPR ntioapi.h which may define RDPDR_FileStandardInformation = 5 etc. */
+#define RDPDR_FileBasicInformation       0x00000004  /* timestamps + attrs */
+#define RDPDR_RDPDR_FileStandardInformation    0x00000005  /* size + allocation */
+
+/* NTSTATUS codes relevant to RDPDR — prefixed to avoid redefinition if WinPR
+ * defines the generic STATUS_SUCCESS in its ntstatus.h. */
+#define RDPDR_STATUS_SUCCESS             0x00000000
+#define RDPDR_STATUS_NO_MORE_FILES       0x80000006  /* end of directory listing */
 
 /* Handshake state for the rdpdr channel */
 typedef enum {
@@ -1334,6 +1360,94 @@ static void rdpdr_send_device_reply(HANDLE ch, uint32_t deviceId, uint32_t resul
     Stream_Free(s, TRUE);
 }
 
+/* Allocate the next monotonic IRP request id and store a pending entry.
+ * Returns 0 if the pending table is full (drop the request). */
+static uint32_t rdpdr_alloc_request(RDPPeerContext *ctx,
+                                     uint32_t deviceId, const char *path) {
+    for (int i = 0; i < RDPDR_MAX_PENDING; i++) {
+        if (ctx->rdpdrPending[i].requestId == 0) {
+            uint32_t rid = ++ctx->rdpdrNextReqId;
+            if (rid == 0) rid = ++ctx->rdpdrNextReqId; /* skip id 0 (sentinel) */
+            ctx->rdpdrPending[i].requestId = rid;
+            ctx->rdpdrPending[i].deviceId  = deviceId;
+            strncpy(ctx->rdpdrPending[i].path, path ? path : "",
+                    sizeof(ctx->rdpdrPending[i].path) - 1);
+            ctx->rdpdrPending[i].path[sizeof(ctx->rdpdrPending[i].path) - 1] = '\0';
+            return rid;
+        }
+    }
+    rdp_verbose("rdpdr: pending table full — dropping IRP for dev %u", deviceId);
+    return 0;
+}
+
+/* Free a slot in the pending table by request id.
+ * Returns the device id associated with the request, or 0 if not found. */
+static uint32_t rdpdr_free_request(RDPPeerContext *ctx, uint32_t requestId) {
+    for (int i = 0; i < RDPDR_MAX_PENDING; i++) {
+        if (ctx->rdpdrPending[i].requestId == requestId) {
+            uint32_t devId = ctx->rdpdrPending[i].deviceId;
+            rdp_verbose("rdpdr: IRP completion for requestId=%u dev=%u path=\"%s\"",
+                        requestId, devId, ctx->rdpdrPending[i].path);
+            ctx->rdpdrPending[i].requestId = 0;
+            return devId;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Send a DR_DRIVE_QUERY_INFORMATION_REQ to ask the client for the standard
+ * file info (size + allocation) for the drive root. This is the simplest IRP
+ * that gives us something useful (free space / total size) without requiring a
+ * CREATE first. The server opens fileId=0 (root pseudo-handle) and asks for
+ * RDPDR_FileStandardInformation. The client will respond with
+ * PAKID_CORE_DEVICE_IOCOMPLETION carrying an IoStatus and the 24-byte
+ * FILE_STANDARD_INFORMATION structure.
+ *
+ * MS-RDPEFS §2.2.3.3.9  DR_DRIVE_QUERY_INFORMATION_REQ
+ * MS-RDPEFS §2.2.3.4.9  DR_DRIVE_QUERY_INFORMATION_RSP
+ */
+static bool rdpdr_send_query_info_req(RDPPeerContext *ctx, uint32_t deviceId) {
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, "\\");
+    if (rid == 0) return false;
+
+    /* Header(4) + DeviceId(4) + FileId(4) + CompletionId(4) +
+     * MajorFunction(4) + MinorFunction(4) + Padding(20) = IRP header 44 bytes
+     * + FsInformationClass(4) + Padding(4) = 52 bytes total */
+    wStream *s = Stream_New(NULL, 52);
+    if (!s) { rdpdr_free_request(ctx, rid); return false; }
+
+    /* Packet header */
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, 0x4952); /* PAKID_CORE_DEVICE_IOREQUEST */
+
+    /* DR_IRP_REQ — MS-RDPEFS §2.2.1.4 */
+    Stream_Write_UINT32(s, deviceId);
+    Stream_Write_UINT32(s, 0);          /* FileId = 0 (root) */
+    Stream_Write_UINT32(s, rid);        /* CompletionId (our request id) */
+    Stream_Write_UINT32(s, IRP_MJ_QUERY_INFORMATION);
+    Stream_Write_UINT32(s, 0);          /* MinorFunction = 0 */
+    /* 20 bytes of padding to complete the 40-byte IRP header body */
+    Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0);
+
+    /* DR_DRIVE_QUERY_INFORMATION_REQ body */
+    Stream_Write_UINT32(s, RDPDR_FileStandardInformation);
+    Stream_Write_UINT32(s, 0); /* padding */
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (ok)
+        rdp_verbose("rdpdr: -> QUERY_INFORMATION_REQ (dev=%u rid=%u "
+                    "RDPDR_FileStandardInformation)", deviceId, rid);
+    else
+        rdpdr_free_request(ctx, rid);
+    return ok;
+}
+
 /* Decode one PDU from the rdpdr channel and advance the state machine. */
 static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
     wStream stack; /* stack-allocated reader; avoids heap alloc for each PDU */
@@ -1441,19 +1555,80 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
 
             if (devType == RDPDR_DTYP_FILESYSTEM) {
                 rdp_info("rdpdr: client drive #%u — id=%u name=\"%s\" "
-                         "(FUSE mount deferred; see feat/rdpdr PR for roadmap)",
+                         "(placeholder on Desktop; full mount requires macFUSE)",
                          (unsigned)i, (unsigned)devId, dosName);
+                /* Create a Desktop placeholder folder so the user has visible
+                 * feedback that the drive was redirected. A full read/write mount
+                 * would require macFUSE (brew install macfuse) and an in-process
+                 * FUSE server that forwards IRP ops — implemented as a follow-up. */
+                rdp_drive_mount_placeholder(dosName);
+                /* Send a RDPDR_FileStandardInformation query to get the drive's
+                 * allocation size. The completion is logged in
+                 * PAKID_CORE_DEVICE_IOCOMPLETION below. */
+                rdpdr_send_query_info_req(ctx, devId);
             } else {
                 rdp_verbose("rdpdr: client device #%u — id=%u name=\"%s\" type=%s (not a drive)",
                             (unsigned)i, (unsigned)devId, dosName, typeName);
             }
 
-            /* ACK every device with STATUS_SUCCESS so the client knows we saw it. */
-            rdpdr_send_device_reply(ctx->rdpdrChannel, devId, 0x00000000);
+            /* ACK every device with RDPDR_STATUS_SUCCESS so the client knows we saw it. */
+            rdpdr_send_device_reply(ctx->rdpdrChannel, devId, RDPDR_STATUS_SUCCESS);
         }
 
         ctx->rdpdrState = kRdpdrReady;
         rdp_info("rdpdr: device enumeration complete — handshake done");
+        break;
+    }
+
+    /* ── IRP I/O Completion (client -> server) ───────────────────────────── */
+    case PAKID_CORE_DEVICE_IOCOMPLETION: {
+        /* MS-RDPEFS §2.2.1.5  DR_DEVICE_IOCOMPLETION
+         * Header(4 already consumed) + DeviceId(4) + CompletionId(4) +
+         * IoStatus(4) = 12 more bytes before the payload. */
+        if (Stream_GetRemainingLength(s) < 12) {
+            rdp_verbose("rdpdr: IOCOMPLETION too short (%zu bytes remaining)",
+                        Stream_GetRemainingLength(s));
+            break;
+        }
+        UINT32 devId, completionId, ioStatus;
+        Stream_Read_UINT32(s, devId);
+        Stream_Read_UINT32(s, completionId);
+        Stream_Read_UINT32(s, ioStatus);
+
+        /* Look up the pending request to give context to the log. */
+        uint32_t matchedDev = rdpdr_free_request(ctx, completionId);
+        if (matchedDev == 0) {
+            /* Could be an unsolicited completion for a request we didn't send
+             * (e.g. the client proactively sending info). Log and ignore. */
+            rdp_verbose("rdpdr: <- IOCOMPLETION dev=%u cid=%u status=0x%08x "
+                        "(no matching pending request)",
+                        devId, completionId, ioStatus);
+            break;
+        }
+
+        if (ioStatus != RDPDR_STATUS_SUCCESS) {
+            rdp_verbose("rdpdr: IOCOMPLETION dev=%u cid=%u status=0x%08x (error)",
+                        devId, completionId, ioStatus);
+            break;
+        }
+
+        /* Remaining bytes are the response payload. For RDPDR_FileStandardInformation
+         * the payload is FILE_STANDARD_INFORMATION (24 bytes):
+         *   AllocationSize(8) + EndOfFile(8) + NumberOfLinks(4) +
+         *   DeletePending(1) + Directory(1) + pad(2). */
+        if (Stream_GetRemainingLength(s) >= 24) {
+            UINT64 allocSize = 0, endOfFile = 0;
+            Stream_Read_UINT64(s, allocSize);
+            Stream_Read_UINT64(s, endOfFile);
+            rdp_info("rdpdr: IOCOMPLETION dev=%u — RDPDR_FileStandardInformation: "
+                     "alloc=%llu bytes, size=%llu bytes",
+                     devId, (unsigned long long)allocSize,
+                     (unsigned long long)endOfFile);
+        } else {
+            rdp_verbose("rdpdr: IOCOMPLETION dev=%u cid=%u status=SUCCESS "
+                        "(payload %zu bytes, not parsed)",
+                        devId, completionId, Stream_GetRemainingLength(s));
+        }
         break;
     }
 

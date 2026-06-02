@@ -75,6 +75,15 @@ struct rdp_peer_context {
     HANDLE               rdpdrEvent;     /* WTSVirtualEventHandle for the run loop */
     int                  rdpdrState;     /* RdpdrHandshakeState enum (int for C compat) */
     uint16_t             rdpdrClientId;  /* client-assigned id from ANNOUNCE_REPLY */
+    uint32_t             rdpdrNextReqId; /* monotonic IRP request id counter */
+    /* Pending IRP request table — up to 8 in-flight requests at once (enumerate
+     * only, so one per drive is typical). Cleared when the completion arrives. */
+#define RDPDR_MAX_PENDING 8
+    struct {
+        uint32_t requestId;  /* 0 = slot free */
+        uint32_t deviceId;
+        char     path[64];   /* requested path, for logging */
+    } rdpdrPending[RDPDR_MAX_PENDING];
     /* cliprdr handshake complete (client sent its Capabilities/Format List). The
      * Mac->Win advertise (ServerFormatList, called from the clipboard POLL thread)
      * MUST NOT run before this — sending a Format List before the channel's send
@@ -159,6 +168,10 @@ void rdp_peer_send_default_cursor(freerdp_peer *peer);
  */
 bool rdp_peer_open_rdpdr(freerdp_peer *peer);
 void rdp_peer_pump_rdpdr(freerdp_peer *peer);
+
+/* Create Desktop placeholder folders for each redirected client drive.
+ * Implemented in protocol/RDPDriveMount.m (ObjC/Foundation). */
+void rdp_drive_mount_placeholder(const char *driveName);
 
 /* Send the ACTUAL current cursor shape as an RDP color-pointer PDU so mstsc
  * renders the correct shape (I-beam, resize, hand, …) client-side, lag-free.

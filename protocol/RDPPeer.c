@@ -281,6 +281,21 @@ static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                     list->formats[i].formatId,
                     list->formats[i].formatName ? list->formats[i].formatName : "(none)");
 
+    /* ALL cliprdr SERVER-SENDS are gated OFF by default (RDP_CLIPBOARD=1 to enable).
+     * Any ServerFormat* send (Response/DataRequest/List) intermittently aborts the
+     * daemon inside FreeRDP's cliprdr serializer (WinPR Stream_Write_UINT32 assert) —
+     * the fork is built WITH_VERBOSE_WINPR_ASSERT=ON, so a borderline write that older
+     * builds tolerated now hard-aborts. mstsc advertises its clipboard on every
+     * connect, so this crash-loops the session (client 0x904) and locks the user out.
+     * Until the fork is rebuilt without verbose asserts (the real fix), receive-only:
+     * log the client's formats but send nothing, so the session stays alive. */
+    const char *clipEnabled = getenv("RDP_CLIPBOARD");
+    if (!(clipEnabled && strcmp(clipEnabled, "1") == 0)) {
+        rdp_verbose("clipboard: server-sends disabled (RDP_CLIPBOARD!=1) — receive-only "
+                    "to avoid the cliprdr serializer abort; session stays alive");
+        return CHANNEL_RC_OK;
+    }
+
     /* Acknowledge the advertisement first (msgType is set by the server serializer,
      * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
     CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};

@@ -1,0 +1,52 @@
+diff --git a/channels/cliprdr/server/cliprdr_main.c b/channels/cliprdr/server/cliprdr_main.c
+index 3cfa057e3..e2e8fe579 100644
+--- a/channels/cliprdr/server/cliprdr_main.c
++++ b/channels/cliprdr/server/cliprdr_main.c
+@@ -533,10 +533,25 @@ static UINT cliprdr_server_receive_capabilities(CliprdrServerContext* context, w
+ 		Stream_Read_UINT16(s, capabilitySetType);   /* capabilitySetType (2 bytes) */
+ 		Stream_Read_UINT16(s, capabilitySetLength); /* capabilitySetLength (2 bytes) */
+ 
+-		cap_sets_size += capabilitySetLength;
++		/* Security fix (backport from upstream master): the destination is an
++		 * array of typed capability-set structs, so the allocation must be sized
++		 * by element count, NOT by the client-supplied capabilitySetLength byte
++		 * value. A CB_CAPSTYPE_GENERAL set with capabilitySetLength < 12 would
++		 * otherwise undersize the buffer while
++		 * cliprdr_server_receive_general_capability() writes 12 bytes, an
++		 * out-of-bounds heap write with client-controlled version/generalFlags. */
++		if (capabilitySetType == CB_CAPSTYPE_GENERAL &&
++		    capabilitySetLength != sizeof(CLIPRDR_GENERAL_CAPABILITY_SET))
++		{
++			WLog_ERR(TAG, "invalid CB_CAPSTYPE_GENERAL capabilitySetLength %" PRIu16 "",
++			         capabilitySetLength);
++			error = ERROR_INVALID_DATA;
++			goto out;
++		}
++
++		cap_sets_size = (index + 1) * sizeof(CLIPRDR_GENERAL_CAPABILITY_SET);
+ 
+-		if (cap_sets_size > 0)
+-			tmp = realloc(capabilities.capabilitySets, cap_sets_size);
++		tmp = realloc(capabilities.capabilitySets, cap_sets_size);
+ 		if (tmp == NULL)
+ 		{
+ 			WLog_ERR(TAG, "capabilities.capabilitySets realloc failed!");
+@@ -1113,7 +1128,17 @@ static UINT cliprdr_server_read(CliprdrServerContext* context)
+ 		Stream_Read_UINT16(s, header.msgFlags); /* msgFlags (2 bytes) */
+ 		Stream_Read_UINT32(s, header.dataLen);  /* dataLen (4 bytes) */
+ 
+-		if (!Stream_EnsureCapacity(s, (header.dataLen + CLIPRDR_HEADER_LENGTH)))
++		/* Security fix (backport): dataLen is attacker-controlled. Reject absurd
++		 * values to avoid a multi-gigabyte allocation (DoS), and compute the
++		 * capacity in size_t so the "+ CLIPRDR_HEADER_LENGTH" cannot wrap a
++		 * 32-bit add. 64 MiB is far larger than any legitimate clipboard PDU. */
++		if (header.dataLen > (64u * 1024u * 1024u))
++		{
++			WLog_ERR(TAG, "client clipboard dataLen %" PRIu32 " exceeds limit", header.dataLen);
++			return ERROR_INVALID_DATA;
++		}
++
++		if (!Stream_EnsureCapacity(s, (size_t)header.dataLen + CLIPRDR_HEADER_LENGTH))
+ 		{
+ 			WLog_ERR(TAG, "Stream_EnsureCapacity failed!");
+ 			return CHANNEL_RC_NO_MEMORY;

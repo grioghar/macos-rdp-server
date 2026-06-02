@@ -1169,6 +1169,20 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
         return true;
     }
 
+    /* Mac->Win advertise (ServerFormatList) is DISABLED BY DEFAULT. It intermittently
+     * aborts the whole daemon inside FreeRDP's cliprdr format-list serializer (WinPR
+     * Stream_Write_UINT32 assert) regardless of formatName="" or handshake gating —
+     * a crash loop that locks the client out (0x904). Win->Mac paste is unaffected
+     * (it uses ServerFormatDataRequest/Response, not ServerFormatList). Until the
+     * serializer crash is root-caused/patched in the fork, gate this behind
+     * RDP_CLIP_MAC2WIN=1 so the daemon stays alive by default. */
+    const char *m2w = getenv("RDP_CLIP_MAC2WIN");
+    if (!(m2w && strcmp(m2w, "1") == 0)) {
+        rdp_verbose("clipboard: Mac->Win advertise OFF (set RDP_CLIP_MAC2WIN=1 to enable); "
+                    "held %zu bytes fmt 0x%08x", len, format);
+        return true;
+    }
+
     /* Advertise the available format; the client requests the bytes on paste.
      *
      * msgType MUST be CB_FORMAT_LIST. Leaving it 0 (CB_TYPE_NONE) triggers the

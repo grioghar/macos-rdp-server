@@ -48,7 +48,7 @@ void rdp_log(RDPLogLevel level, const char *component,
     va_start(ap, fmt);
 
     /* Format the message body first. */
-    char body[1024];
+    char body[4096]; /* was 1024 — enlarged to avoid silent truncation of diagnostic messages */
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
 

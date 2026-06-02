@@ -42,6 +42,12 @@ static inline int16_t clampF32(float f) {
      * would itself cause a pitch shift). */
     uint64_t _diagFrames;
     uint64_t _diagLastHostTime;
+    /* Pre-allocated PCM output buffer — reused across IO-proc callbacks to
+     * eliminate per-callback malloc/free at ~100 Hz.  Resized (realloc)
+     * only when the output frame count grows (rare: only if the ratio
+     * src/outRate changes or inFrames grows). */
+    int16_t  *_pcmBuf;
+    size_t    _pcmBufFrames;
     double   _hostTicksToSeconds;
 }
 @property (nonatomic, assign) AudioObjectID       tapID;        /* process tap            */
@@ -287,12 +293,14 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
         }
         if (_tapID != kAudioObjectUnknown) {
             AudioHardwareDestroyProcessTap(_tapID);
+            if (_pcmBuf) { free(_pcmBuf); _pcmBuf = NULL; _pcmBufFrames = 0; }
             _tapID = kAudioObjectUnknown;
         }
         return;
     }
 #endif
     _capturing = NO;
+    if (_pcmBuf) { free(_pcmBuf); _pcmBuf = NULL; _pcmBufFrames = 0; }
 }
 
 /* Convert one IO-proc buffer (float32, _srcChannels, _srcSampleRate) into
@@ -343,11 +351,24 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
                                                         memory_order_relaxed);
     const double ratio = (_srcSampleRate > 0 ? outRate / _srcSampleRate : 1.0);
 
+    /* Reuse the pre-allocated PCM buffer, growing it (realloc) only when the
+     * required output frame count exceeds the current capacity. This eliminates
+     * the per-callback malloc/free pair that previously ran at ~100 Hz (once
+     * per IO proc call at the aggregate device's buffer size). */
+    uint32_t maxOut = (_srcSampleRate == outRate)
+        ? inFrames
+        : (uint32_t)((inFrames + 1) * ratio) + 2;
+    if (maxOut > _pcmBufFrames) {
+        int16_t *nb = (int16_t *)realloc(_pcmBuf,
+                                          (size_t)maxOut * kRDPChannels *
+                                          sizeof(int16_t));
+        if (!nb) return;
+        _pcmBuf = nb; _pcmBufFrames = maxOut;
+    }
+    int16_t *pcm = _pcmBuf;
+
     /* Fast path: source already at the output rate — just downmix to stereo. */
     if (_srcSampleRate == outRate) {
-        int16_t *pcm = (int16_t *)malloc((size_t)inFrames * kRDPChannels *
-                                         sizeof(int16_t));
-        if (!pcm) return;
         for (uint32_t f = 0; f < inFrames; f++) {
             float l, r;
             [self readFrame:in index:f channels:srcCh outL:&l outR:&r];
@@ -355,18 +376,12 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
             pcm[f * 2 + 1] = clampF32(r);
         }
         cb(pcm, inFrames);
-        free(pcm);
         return;
     }
 
     /* Linear resample to output-rate stereo. Generate output frames by walking a
      * fractional read position across the input block, carrying the tail
      * sample between callbacks for continuity. */
-    uint32_t maxOut = (uint32_t)((inFrames + 1) * ratio) + 2;
-    int16_t *pcm = (int16_t *)malloc((size_t)maxOut * kRDPChannels *
-                                     sizeof(int16_t));
-    if (!pcm) return;
-
     double phase = _resamplePhase;      /* fractional input index in [0,inFrames) */
     float prevL = _lastL, prevR = _lastR;
     BOOL haveLast = _haveLast;
@@ -403,7 +418,6 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     if (_resamplePhase < 0) _resamplePhase = 0;
 
     if (outCount) cb(pcm, outCount);
-    free(pcm);
 }
 
 /* Read one interleaved float frame, downmixing to a stereo (L,R) pair. */

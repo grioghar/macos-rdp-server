@@ -1233,13 +1233,24 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
 
     /* Store an owned copy of the host clipboard; we hand it to the client only
      * when it sends a Format Data Request. Advertising data unsolicited (the
-     * old behaviour) violates MS-RDPECLIP and clients ignore it. */
-    free(ctx->clipData);
-    ctx->clipData = (uint8_t *)malloc(len);
-    if (!ctx->clipData) { ctx->clipLen = 0; return false; }
-    memcpy(ctx->clipData, data, len);
-    ctx->clipLen    = len;
-    ctx->clipFormat = format;
+     * old behaviour) violates MS-RDPECLIP and clients ignore it.
+     *
+     * Thread safety: malloc+copy happens outside the lock (no heap allocation
+     * while holding xportLock keeps the audio thread unblocked). We then
+     * take xportLock for the pointer swap, which is the same lock the reader
+     * (cliprdr_client_format_data_request) holds while accessing clipData/Len.
+     * This prevents a reader from seeing a half-updated clipData/clipLen pair. */
+    uint8_t *newClipData = (uint8_t *)malloc(len ? len : 1);
+    if (!newClipData) { rdp_verbose("clipboard: malloc failed"); return false; }
+    if (len) memcpy(newClipData, data, len);
+    uint8_t *oldClipData;
+    pthread_mutex_lock(&ctx->xportLock);
+    oldClipData      = ctx->clipData;
+    ctx->clipData    = newClipData;
+    ctx->clipLen     = len;
+    ctx->clipFormat  = format;
+    pthread_mutex_unlock(&ctx->xportLock);
+    free(oldClipData);  /* free old buffer AFTER lock released */
 
     /* Hold the data but DO NOT advertise until the cliprdr handshake is complete.
      * Calling ServerFormatList before the client has engaged the channel corrupts

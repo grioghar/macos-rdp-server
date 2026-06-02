@@ -23,7 +23,11 @@
 
 #import <Foundation/Foundation.h>
 
-void rdp_drive_mount_placeholder(const char *driveName) {
+#if __has_include(<FileProvider/FileProvider.h>)
+#import "daemon/FileProvider/RDPFileProvider.h"
+#endif
+
+void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId) {
     if (!driveName || !*driveName) return;
 
     @autoreleasepool {
@@ -85,5 +89,12 @@ void rdp_drive_mount_placeholder(const char *driveName) {
 
         rdp_info("rdpdr: placeholder created at %s (File Provider mount in progress)",
                  driveDir.path.UTF8String);
+
+        /* Register an NSFileProviderDomain for this drive so Finder can expose
+         * it as a virtual volume.  The actual I/O (IRP forwarding) is wired up
+         * in a later phase; for now this just announces the domain. */
+#if __has_include(<FileProvider/FileProvider.h>)
+        [RDPFileProvider mountDrive:name deviceId:deviceId];
+#endif
     }
 }

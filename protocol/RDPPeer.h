@@ -169,9 +169,11 @@ void rdp_peer_send_default_cursor(freerdp_peer *peer);
 bool rdp_peer_open_rdpdr(freerdp_peer *peer);
 void rdp_peer_pump_rdpdr(freerdp_peer *peer);
 
-/* Create Desktop placeholder folders for each redirected client drive.
- * Implemented in protocol/RDPDriveMount.m (ObjC/Foundation). */
-void rdp_drive_mount_placeholder(const char *driveName);
+/* Create Desktop placeholder folders for each redirected client drive and
+ * register an NSFileProviderDomain (macOS 12+) for the drive.
+ * Implemented in protocol/RDPDriveMount.m (ObjC/Foundation).
+ * deviceId — the RDPDR device id from DEVICE_LIST_ANNOUNCE. */
+void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId);
 
 /* Send the ACTUAL current cursor shape as an RDP color-pointer PDU so mstsc
  * renders the correct shape (I-beam, resize, hand, …) client-side, lag-free.

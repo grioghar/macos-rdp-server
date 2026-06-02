@@ -1572,7 +1572,7 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
                  * feedback that the drive was redirected. A full read/write mount
                  * is being implemented using Apple's File Provider framework
                  * (NSFileProviderReplicatedExtension) — no macFUSE/brew/kext needed. */
-                rdp_drive_mount_placeholder(dosName);
+                rdp_drive_mount_placeholder(dosName, devId);
                 /* Send a RDPDR_FileStandardInformation query to get the drive's
                  * allocation size. The completion is logged in
                  * PAKID_CORE_DEVICE_IOCOMPLETION below. */

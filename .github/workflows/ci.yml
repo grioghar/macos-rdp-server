@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v7-rdpdr
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v8-secfix
 
       - name: Build FreeRDP (static, fork branch)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'

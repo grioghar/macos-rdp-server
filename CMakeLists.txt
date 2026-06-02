@@ -132,6 +132,14 @@ set_property(TARGET macos-rdp-daemon PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 
 # MACOS_RDP_VIRTUAL_DISPLAY: create a CGVirtualDisplay sized to the RDP client
 # (no pillarbox / 1:1 input). Falls back to the main display if the private API fails.
+# ── Feature flags ─────────────────────────────────────────────────────────
+# RDP_RDPDR_ENABLED: compile-in the RDPDR drive-redirection channel handler.
+# Default OFF — the feature is new and unverified on hardware. Enable at
+# runtime with the env-var RDP_RDPDR_ENABLED=1 (checked at peer-connect time).
+option(RDP_RDPDR_ENABLED
+       "Include MS-RDPEFS (rdpdr) drive-redirection channel handler"
+       OFF)
+
 target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_VERSION="0.1.6"
     MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"

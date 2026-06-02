@@ -10,6 +10,7 @@
 #include <freerdp/server/cliprdr.h>
 #include <freerdp/server/rdpsnd.h>
 #include <freerdp/channels/wtsvc.h>
+#include <winpr/wtsapi.h>
 
 typedef struct rdp_peer_context RDPPeerContext;
 
@@ -68,6 +69,12 @@ struct rdp_peer_context {
      * advertised a Format List (Win->Mac paste). The matching ClientFormatDataResponse
      * carries no format id of its own, so we remember what we requested. */
     uint32_t             clipReqFormat;
+    /* RDPDR (MS-RDPEFS) drive-redirection static VC. Non-NULL only when
+     * RDP_RDPDR_ENABLED=1. Raw WTS channel; protocol state machine runs in C. */
+    HANDLE               rdpdrChannel;   /* WTSVirtualChannelOpen handle */
+    HANDLE               rdpdrEvent;     /* WTSVirtualEventHandle for the run loop */
+    int                  rdpdrState;     /* RdpdrHandshakeState enum (int for C compat) */
+    uint16_t             rdpdrClientId;  /* client-assigned id from ANNOUNCE_REPLY */
     /* cliprdr handshake complete (client sent its Capabilities/Format List). The
      * Mac->Win advertise (ServerFormatList, called from the clipboard POLL thread)
      * MUST NOT run before this — sending a Format List before the channel's send
@@ -136,6 +143,22 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
 /* Tell the client to render the default system pointer CLIENT-SIDE, so the cursor
  * tracks the local mouse smoothly instead of being tied to the (30fps) video. */
 void rdp_peer_send_default_cursor(freerdp_peer *peer);
+
+/*
+ * RDPDR (drive redirection) channel support.
+ *
+ * rdp_peer_open_rdpdr  — open the "rdpdr" WTS static virtual channel and send
+ *   SERVER_ANNOUNCE. Should be called from peer_post_connect (or later once the
+ *   VCM is ready). Returns true on success.
+ *
+ * rdp_peer_pump_rdpdr  — drain inbound rdpdr data and advance the MS-RDPEFS
+ *   state machine. Call from the peer run loop whenever the rdpdr channel event
+ *   is signaled, under xportLock.
+ *
+ * Both are no-ops when RDP_RDPDR_ENABLED != "1".
+ */
+bool rdp_peer_open_rdpdr(freerdp_peer *peer);
+void rdp_peer_pump_rdpdr(freerdp_peer *peer);
 
 /* Send the ACTUAL current cursor shape as an RDP color-pointer PDU so mstsc
  * renders the correct shape (I-beam, resize, hand, …) client-side, lag-free.

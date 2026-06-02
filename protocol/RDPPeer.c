@@ -16,9 +16,39 @@
 #include <winpr/ssl.h>
 #include <winpr/synch.h>
 #include <winpr/wtsapi.h>
+#include <winpr/stream.h>
 #include <string.h>
 #include <stdlib.h>
 #include <pthread.h>
+
+/* ── MS-RDPEFS (rdpdr) protocol constants ──────────────────────────────── */
+/* Packet ids from MS-RDPEFS specification §2.2.1.1 */
+#define RDPDR_CTYP_CORE                  0x4472
+#define PAKID_CORE_SERVER_ANNOUNCE       0x496E
+#define PAKID_CORE_CLIENTID_CONFIRM      0x4343
+#define PAKID_CORE_CLIENT_NAME           0x434E
+#define PAKID_CORE_CAPABILITY_REQUEST    0x5350
+#define PAKID_CORE_CAPABILITY_RESPONSE   0x4350
+#define PAKID_CORE_CLIENT_ANNOUNCE_REPLY 0x4352
+#define PAKID_CORE_DEVICE_LIST_ANNOUNCE  0x4441
+#define PAKID_CORE_DEVICE_REPLY          0x6472
+#define RDPDR_DTYP_FILESYSTEM            0x00000008
+#define RDPDR_DTYP_PRINT                 0x00000004
+#define RDPDR_DTYP_SERIAL                0x00000001
+#define RDPDR_DTYP_PARALLEL              0x00000002
+#define RDPDR_DTYP_SMARTCARD             0x00000020
+#define CAP_GENERAL_TYPE                 0x0001
+#define RDPDR_VERSION_MAJOR              0x0001
+#define RDPDR_VERSION_MINOR              0x000C
+
+/* Handshake state for the rdpdr channel */
+typedef enum {
+    kRdpdrIdle = 0,
+    kRdpdrSentAnnounce,
+    kRdpdrReceivedName,
+    kRdpdrReady,
+    kRdpdrError,
+} RdpdrHandshakeState;
 
 /* TLS material directory. Defaults to /etc/macos-rdp (root LaunchDaemon model);
  * override with RDP_CERT_DIR when running as a LaunchAgent in the user session,
@@ -119,6 +149,12 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
+    /* Close rdpdr raw WTS channel (opened when RDP_RDPDR_ENABLED=1). */
+    if (c->rdpdrChannel && c->rdpdrChannel != INVALID_HANDLE_VALUE) {
+        WTSVirtualChannelClose(c->rdpdrChannel);
+        c->rdpdrChannel = NULL;
+        c->rdpdrEvent   = NULL;
+    }
     if (c->vcm)    { WTSCloseServer(c->vcm);                 c->vcm    = NULL; }
     if (c->clipData) { free(c->clipData); c->clipData = NULL; c->clipLen = 0; }
     pthread_mutex_destroy(&c->xportLock);
@@ -584,6 +620,11 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         }
     }
 
+    /* RDPDR drive-redirection static VC. Gated behind RDP_RDPDR_ENABLED=1. The
+     * channel open is best-effort: if the client didn't advertise "rdpdr" in its
+     * channel list, WTSVirtualChannelOpen returns NULL and we log + continue. */
+    rdp_peer_open_rdpdr(peer);
+
     /* Audio. Advertise raw PCM stereo 16-bit at the standard rates mstsc
      * expects (48000 / 44100 / 22050). We DELIBERATELY offer only raw PCM, no
      * compressed codecs (AAC/ADPCM/GSM): our SendSamples feeds raw PCM, so a
@@ -819,6 +860,9 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
         if (clipEvent) events[nCount++] = clipEvent;
     }
 
+    /* RDPDR static VC event (only when RDP_RDPDR_ENABLED=1 and channel open). */
+    if (ctx->rdpdrEvent) events[nCount++] = ctx->rdpdrEvent;
+
     DWORD status = WaitForMultipleObjects(nCount, events, FALSE, 50 /*ms*/);
     if (status == WAIT_FAILED) {
         rdp_error("WaitForMultipleObjects failed");
@@ -884,6 +928,12 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
             if (crc != CHANNEL_RC_OK)
                 rdp_verbose("clipboard read failed: %u", crc);
         }
+    }
+
+    /* Drain rdpdr static VC messages (RDP_RDPDR_ENABLED=1 only). */
+    if (ok && ctx->rdpdrEvent &&
+        WaitForSingleObject(ctx->rdpdrEvent, 0) == WAIT_OBJECT_0) {
+        rdp_peer_pump_rdpdr(peer);
     }
 
     pthread_mutex_unlock(&ctx->xportLock);
@@ -1202,4 +1252,292 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
     pthread_mutex_unlock(&ctx->xportLock);
     rdp_verbose("clipboard: advertised format 0x%08x (%zu bytes held)", format, len);
     return true;
+}
+
+/* ── RDPDR (MS-RDPEFS) drive-redirection implementation ─────────────────── */
+
+/* Write a complete wStream PDU to the rdpdr WTS channel.
+ * Called under xportLock (transport write). */
+static bool rdpdr_write_pdu(HANDLE ch, wStream *s) {
+    size_t len     = Stream_GetPosition(s);
+    BYTE  *buf     = Stream_Buffer(s);
+    ULONG  written = 0;
+    BOOL   ok      = WTSVirtualChannelWrite(ch, (PCHAR)buf, (ULONG)len, &written);
+    return ok && written == (ULONG)len;
+}
+
+static bool rdpdr_send_server_announce(HANDLE ch) {
+    /* Header(4) + VersionMajor(2) + VersionMinor(2) + ClientId(4) */
+    wStream *s = Stream_New(NULL, 12);
+    if (!s) return false;
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_SERVER_ANNOUNCE);
+    Stream_Write_UINT16(s, RDPDR_VERSION_MAJOR);
+    Stream_Write_UINT16(s, RDPDR_VERSION_MINOR);
+    Stream_Write_UINT32(s, 1);   /* initial ClientId = 1 */
+    bool ok = rdpdr_write_pdu(ch, s);
+    Stream_Free(s, TRUE);
+    if (ok) rdp_verbose("rdpdr: -> SERVER_ANNOUNCE");
+    return ok;
+}
+
+static bool rdpdr_send_caps_request(HANDLE ch) {
+    /* Header(4) + numCaps(2) + pad(2) + one GeneralCap(44) = 52 bytes */
+    wStream *s = Stream_New(NULL, 52);
+    if (!s) return false;
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_CAPABILITY_REQUEST);
+    Stream_Write_UINT16(s, 1);    /* numCapabilities */
+    Stream_Write_UINT16(s, 0);    /* padding */
+    /* General capability set (MS-RDPEFS §2.2.2.7.1) */
+    Stream_Write_UINT16(s, CAP_GENERAL_TYPE);
+    Stream_Write_UINT16(s, 44);   /* capabilityLength */
+    Stream_Write_UINT32(s, 2);    /* version */
+    Stream_Write_UINT32(s, 0);    /* osType */
+    Stream_Write_UINT32(s, 0);    /* osVersion */
+    Stream_Write_UINT16(s, RDPDR_VERSION_MAJOR);
+    Stream_Write_UINT16(s, RDPDR_VERSION_MINOR);
+    Stream_Write_UINT32(s, 0x00007fff); /* ioCode1 */
+    Stream_Write_UINT32(s, 0);          /* ioCode2 */
+    Stream_Write_UINT32(s, 0x0000000f); /* extendedPDU */
+    Stream_Write_UINT32(s, 0);          /* extraFlags1 */
+    Stream_Write_UINT32(s, 0);          /* extraFlags2 */
+    Stream_Write_UINT32(s, 0);          /* specialTypeDeviceCap */
+    bool ok = rdpdr_write_pdu(ch, s);
+    Stream_Free(s, TRUE);
+    if (ok) rdp_verbose("rdpdr: -> CAPABILITY_REQUEST (1 cap)");
+    return ok;
+}
+
+static bool rdpdr_send_clientid_confirm(HANDLE ch, uint16_t clientId) {
+    wStream *s = Stream_New(NULL, 12);
+    if (!s) return false;
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_CLIENTID_CONFIRM);
+    Stream_Write_UINT16(s, RDPDR_VERSION_MAJOR);
+    Stream_Write_UINT16(s, RDPDR_VERSION_MINOR);
+    Stream_Write_UINT32(s, (UINT32)clientId);
+    bool ok = rdpdr_write_pdu(ch, s);
+    Stream_Free(s, TRUE);
+    if (ok) rdp_verbose("rdpdr: -> CLIENTID_CONFIRM (clientId=%u)", (unsigned)clientId);
+    return ok;
+}
+
+static void rdpdr_send_device_reply(HANDLE ch, uint32_t deviceId, uint32_t result) {
+    wStream *s = Stream_New(NULL, 12);
+    if (!s) return;
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_DEVICE_REPLY);
+    Stream_Write_UINT32(s, deviceId);
+    Stream_Write_UINT32(s, result);
+    rdpdr_write_pdu(ch, s);
+    Stream_Free(s, TRUE);
+}
+
+/* Decode one PDU from the rdpdr channel and advance the state machine. */
+static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
+    wStream stack; /* stack-allocated reader; avoids heap alloc for each PDU */
+    wStream *s = Stream_StaticInit(&stack, buf, (size_t)len);
+
+    if (Stream_GetRemainingLength(s) < 4) return;
+    UINT16 component, packetId;
+    Stream_Read_UINT16(s, component);
+    Stream_Read_UINT16(s, packetId);
+    if (component != RDPDR_CTYP_CORE) {
+        rdp_verbose("rdpdr: unknown component 0x%04x", component);
+        return;
+    }
+
+    switch (packetId) {
+
+    case PAKID_CORE_CLIENT_ANNOUNCE_REPLY: {
+        if (Stream_GetRemainingLength(s) < 8) break;
+        UINT16 maj, min; UINT32 cid;
+        Stream_Read_UINT16(s, maj);
+        Stream_Read_UINT16(s, min);
+        Stream_Read_UINT32(s, cid);
+        ctx->rdpdrClientId = (uint16_t)(cid & 0xFFFF);
+        rdp_verbose("rdpdr: <- CLIENT_ANNOUNCE_REPLY v%u.%u clientId=%u",
+                    (unsigned)maj, (unsigned)min, (unsigned)ctx->rdpdrClientId);
+        break;
+    }
+
+    case PAKID_CORE_CLIENT_NAME: {
+        if (Stream_GetRemainingLength(s) < 12) break;
+        UINT32 unicodeFlag, codePage, nameLen;
+        Stream_Read_UINT32(s, unicodeFlag);
+        Stream_Read_UINT32(s, codePage);
+        Stream_Read_UINT32(s, nameLen);
+        (void)codePage;
+        char name[128] = "(empty)";
+        if (nameLen > 0 && (size_t)nameLen <= Stream_GetRemainingLength(s)) {
+            if (unicodeFlag && nameLen >= 2) {
+                size_t chars = (nameLen / 2 < 127) ? nameLen / 2 : 127;
+                for (size_t i = 0; i < chars; i++) {
+                    UINT16 wc; Stream_Read_UINT16(s, wc);
+                    name[i] = (wc && wc < 128) ? (char)wc : '?';
+                    if (!wc) { name[i] = '\0'; break; }
+                }
+                name[chars] = '\0';
+            } else {
+                size_t n = (nameLen < 127) ? nameLen : 127;
+                Stream_Read(s, name, n);
+                name[n] = '\0';
+            }
+        }
+        rdp_verbose("rdpdr: <- CLIENT_NAME \"%s\"", name);
+
+        /* Both ANNOUNCE_REPLY and NAME received — send caps + confirm. */
+        if (ctx->rdpdrState == kRdpdrSentAnnounce) {
+            if (rdpdr_send_caps_request(ctx->rdpdrChannel) &&
+                rdpdr_send_clientid_confirm(ctx->rdpdrChannel, ctx->rdpdrClientId)) {
+                ctx->rdpdrState = kRdpdrReceivedName;
+            } else {
+                ctx->rdpdrState = kRdpdrError;
+                rdp_error("rdpdr: failed to send caps/confirm");
+            }
+        }
+        break;
+    }
+
+    case PAKID_CORE_CAPABILITY_RESPONSE: {
+        if (Stream_GetRemainingLength(s) < 4) break;
+        UINT16 numCaps, pad;
+        Stream_Read_UINT16(s, numCaps);
+        Stream_Read_UINT16(s, pad);
+        (void)pad;
+        rdp_verbose("rdpdr: <- CAPABILITY_RESPONSE (%u caps)", (unsigned)numCaps);
+        /* We accept whatever the client advertises; no negotiation needed for
+         * enumeration-only mode. Stay in ReceivedName until device list arrives. */
+        break;
+    }
+
+    case PAKID_CORE_DEVICE_LIST_ANNOUNCE: {
+        if (Stream_GetRemainingLength(s) < 4) break;
+        UINT32 deviceCount;
+        Stream_Read_UINT32(s, deviceCount);
+        rdp_info("rdpdr: <- DEVICE_LIST_ANNOUNCE — %u device(s)", (unsigned)deviceCount);
+
+        for (UINT32 i = 0; i < deviceCount; i++) {
+            if (Stream_GetRemainingLength(s) < 20) break;
+            UINT32 devType, devId, dataLen;
+            char dosName[9] = {0};
+            Stream_Read_UINT32(s, devType);
+            Stream_Read_UINT32(s, devId);
+            Stream_Read(s, dosName, 8);
+            dosName[8] = '\0';
+            Stream_Read_UINT32(s, dataLen);
+            if (dataLen > 0 && (size_t)dataLen <= Stream_GetRemainingLength(s))
+                Stream_Seek(s, (size_t)dataLen);
+
+            const char *typeName = "unknown";
+            switch (devType) {
+                case RDPDR_DTYP_FILESYSTEM: typeName = "drive";     break;
+                case RDPDR_DTYP_PRINT:      typeName = "printer";   break;
+                case RDPDR_DTYP_SERIAL:     typeName = "serial";    break;
+                case RDPDR_DTYP_PARALLEL:   typeName = "parallel";  break;
+                case RDPDR_DTYP_SMARTCARD:  typeName = "smartcard"; break;
+            }
+
+            if (devType == RDPDR_DTYP_FILESYSTEM) {
+                rdp_info("rdpdr: client drive #%u — id=%u name=\"%s\" "
+                         "(FUSE mount deferred; see feat/rdpdr PR for roadmap)",
+                         (unsigned)i, (unsigned)devId, dosName);
+            } else {
+                rdp_verbose("rdpdr: client device #%u — id=%u name=\"%s\" type=%s (not a drive)",
+                            (unsigned)i, (unsigned)devId, dosName, typeName);
+            }
+
+            /* ACK every device with STATUS_SUCCESS so the client knows we saw it. */
+            rdpdr_send_device_reply(ctx->rdpdrChannel, devId, 0x00000000);
+        }
+
+        ctx->rdpdrState = kRdpdrReady;
+        rdp_info("rdpdr: device enumeration complete — handshake done");
+        break;
+    }
+
+    default:
+        rdp_verbose("rdpdr: unhandled packetId=0x%04x in state=%d", packetId, ctx->rdpdrState);
+        break;
+    }
+}
+
+/*
+ * Open the "rdpdr" static virtual channel. Called from peer_post_connect when
+ * RDP_RDPDR_ENABLED=1. Returns true if the channel opened and SERVER_ANNOUNCE
+ * was sent successfully.
+ */
+bool rdp_peer_open_rdpdr(freerdp_peer *peer) {
+    const char *env = getenv("RDP_RDPDR_ENABLED");
+    if (!env || strcmp(env, "1") != 0) {
+        rdp_verbose("rdpdr: disabled (RDP_RDPDR_ENABLED != 1)");
+        return false;
+    }
+
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    if (!ctx->vcm || ctx->vcm == INVALID_HANDLE_VALUE) {
+        rdp_error("rdpdr: VCM not open");
+        return false;
+    }
+
+    /* Open as a STATIC virtual channel. rdpdr is always static (not drdynvc). */
+    ctx->rdpdrChannel = WTSVirtualChannelOpen(ctx->vcm,
+                                               WTS_CURRENT_SESSION,
+                                               (LPSTR)"rdpdr");
+    if (!ctx->rdpdrChannel || ctx->rdpdrChannel == INVALID_HANDLE_VALUE) {
+        ctx->rdpdrChannel = NULL;
+        rdp_verbose("rdpdr: WTSVirtualChannelOpen failed — "
+                    "client may not have advertised the channel");
+        return false;
+    }
+
+    /* Retrieve the channel's event handle for the run-loop WaitForMultipleObjects. */
+    void   *evPtr = NULL;
+    ULONG   evLen = sizeof(evPtr);
+    if (WTSVirtualChannelQuery(ctx->rdpdrChannel,
+                               WTSVirtualEventHandle, &evPtr, &evLen) && evPtr) {
+        ctx->rdpdrEvent = (HANDLE)*(void **)evPtr;
+        WTSFreeMemory(evPtr);
+    }
+
+    ctx->rdpdrState    = kRdpdrSentAnnounce;
+    ctx->rdpdrClientId = 0;
+
+    /* Send the first handshake PDU under xportLock. */
+    pthread_mutex_lock(&ctx->xportLock);
+    bool ok = rdpdr_send_server_announce(ctx->rdpdrChannel);
+    pthread_mutex_unlock(&ctx->xportLock);
+
+    if (!ok) {
+        rdp_error("rdpdr: SERVER_ANNOUNCE write failed");
+        WTSVirtualChannelClose(ctx->rdpdrChannel);
+        ctx->rdpdrChannel = NULL;
+        ctx->rdpdrEvent   = NULL;
+        ctx->rdpdrState   = kRdpdrError;
+        return false;
+    }
+
+    rdp_info("rdpdr: channel open and SERVER_ANNOUNCE sent");
+    return true;
+}
+
+/*
+ * Drain all pending inbound PDUs from the rdpdr channel and advance the
+ * MS-RDPEFS handshake state machine. Called from the peer run loop under
+ * xportLock whenever the rdpdr event handle fires.
+ */
+void rdp_peer_pump_rdpdr(freerdp_peer *peer) {
+    RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
+    if (!ctx->rdpdrChannel || ctx->rdpdrState == kRdpdrError) return;
+
+    for (;;) {
+        PCHAR buf = NULL;
+        ULONG len = 0;
+        /* timeout=0: non-blocking read; returns FALSE with no data available. */
+        if (!WTSVirtualChannelRead(ctx->rdpdrChannel, 0, &buf, &len)) break;
+        if (!buf || len == 0) { if (buf) WTSFreeMemory(buf); break; }
+        rdpdr_handle_pdu(ctx, (BYTE *)buf, len);
+        WTSFreeMemory(buf);
+    }
 }

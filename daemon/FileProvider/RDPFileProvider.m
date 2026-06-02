@@ -45,9 +45,10 @@
 
     [NSFileProviderManager addDomain:domain completionHandler:^(NSError * _Nullable error) {
         if (error) {
-            /* NSFileProviderErrorDomainAlreadyMounted (-2008) is benign —
-             * another session already added this drive. Log at verbose level. */
-            if (error.code == NSFileProviderErrorDomainAlreadyMounted) {
+            /* Error code -2008 (NSFileProviderErrorDomainAlreadyMounted, added
+             * iOS 16 / macOS 13) is benign — another session already added this
+             * drive. Use the raw constant to remain compilable on macOS 12 SDK. */
+            if (error.code == (NSInteger)(-2008)) {
                 rdp_verbose("fileprovider: domain \"%s\" already mounted — reusing",
                             domainId.UTF8String);
             } else {

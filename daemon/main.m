@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <ApplicationServices/ApplicationServices.h>
+#import <IOKit/pwr_mgt/IOPMLib.h>
 #import <syslog.h>
 #import <signal.h>
 #import <sys/event.h>
@@ -111,6 +112,29 @@ int main(int argc, char *argv[]) {
         }
         rdp_info("listening on port %u", port);
 
+        /* Keep the system from idle-sleeping while the daemon is loaded, so an
+         * open-lid Mac stays reachable on the LAN / Tailscale even when the user
+         * is away. Without this the Mac goes idle, drops off the network, and
+         * remote connections fail with 0x904. Per-session display-sleep assertions
+         * are still held in DisplayControl for the duration of each session.
+         * RDP_ALLOW_IDLE_SLEEP=1 disables this for setups where battery life
+         * matters more than always-on reachability. */
+        IOPMAssertionID daemonWakeAssertion = kIOPMNullAssertionID;
+        const char *allowSleep = getenv("RDP_ALLOW_IDLE_SLEEP");
+        if (!(allowSleep && strcmp(allowSleep, "1") == 0)) {
+            IOReturn ar = IOPMAssertionCreateWithName(
+                kIOPMAssertionTypePreventUserIdleSystemSleep,
+                kIOPMAssertionLevelOn,
+                CFSTR("macos-rdp: daemon loaded (keep reachable)"),
+                &daemonWakeAssertion);
+            if (ar == kIOReturnSuccess)
+                rdp_info("holding system-sleep assertion for daemon lifetime "
+                         "(set RDP_ALLOW_IDLE_SLEEP=1 to disable)");
+            else
+                rdp_error("daemon-lifetime sleep assertion failed (0x%x) — "
+                          "Mac may sleep and become unreachable", ar);
+        }
+
         /* Start the silent self-updater (no-op if RDP_UPDATE_ENABLED=0). It
          * runs entirely on its own background serial queue + dispatch timer —
          * it never touches the main thread (which is about to park in kevent). */
@@ -131,6 +155,8 @@ int main(int argc, char *argv[]) {
         close(kq);
 
         rdp_info("shutting down");
+        if (daemonWakeAssertion != kIOPMNullAssertionID)
+            IOPMAssertionRelease(daemonWakeAssertion);
         [server stop];
         closelog();
         return 0;

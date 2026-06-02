@@ -24,6 +24,8 @@
     <dict>
         <key>RDP_CERT_DIR</key><string>__CERT_DIR__</string>
         <key>RDP_LOG_LEVEL</key><string>verbose</string>
+        <key>RDP_RDPDR_ENABLED</key><string>1</string>
+        <key>RDP_CURSOR_SHAPES</key><string>1</string>
     </dict>
     <key>StandardOutPath</key><string>__LOG_DIR__/macos-rdp-agent.log</string>
     <key>StandardErrorPath</key><string>__LOG_DIR__/macos-rdp-agent.error.log</string>

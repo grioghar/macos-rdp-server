@@ -1566,12 +1566,12 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
 
             if (devType == RDPDR_DTYP_FILESYSTEM) {
                 rdp_info("rdpdr: client drive #%u — id=%u name=\"%s\" "
-                         "(placeholder on Desktop; full mount requires macFUSE)",
+                         "(placeholder on Desktop; File Provider mount in progress)",
                          (unsigned)i, (unsigned)devId, dosName);
                 /* Create a Desktop placeholder folder so the user has visible
                  * feedback that the drive was redirected. A full read/write mount
-                 * would require macFUSE (brew install macfuse) and an in-process
-                 * FUSE server that forwards IRP ops — implemented as a follow-up. */
+                 * is being implemented using Apple's File Provider framework
+                 * (NSFileProviderReplicatedExtension) — no macFUSE/brew/kext needed. */
                 rdp_drive_mount_placeholder(dosName);
                 /* Send a RDPDR_FileStandardInformation query to get the drive's
                  * allocation size. The completion is logged in

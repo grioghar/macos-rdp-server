@@ -1,15 +1,16 @@
 /* RDPDriveMount.m — macOS placeholder mount for RDPDR-redirected client drives.
  *
  * After the MS-RDPEFS handshake, the server knows which client drives exist (by
- * name and device id). A full read/write mount would require macFUSE:
- *   brew install macfuse
- * and an in-process userspace filesystem that translates IRP ops (Create, Read,
- * Write, QueryDirectory, etc.) into WTS channel PDUs.  That is a large lift
- * tracked as a follow-up.
+ * name and device id). This file implements the desktop-visible placeholder while
+ * the full File Provider (NSFileProviderReplicatedExtension) mount is being built.
  *
- * This file implements Option C: create a visible folder on the Mac desktop so
- * the user can see which drives are redirected, and drop an INFO file there that
- * explains the current limitation.
+ * Architecture decision: we use Apple's File Provider framework instead of FUSE
+ * for drive mounting. File Provider requires no kext, no third-party kernel
+ * extensions, and no brew dependencies — it is a pure Swift/Obj-C extension that
+ * runs in-process and presents the Windows drive as a native ~/Desktop/RDP-Drives/
+ * volume. IRP ops (Create, Read, Write, QueryDirectory, Close) are translated into
+ * WTS channel PDUs inside the extension's NSFileProviderReplicatedExtension
+ * implementation. See daemon/FileProvider/ for the in-progress implementation.
  *
  * Called from protocol/RDPPeer.c after DEVICE_LIST_ANNOUNCE under xportLock.
  * The function is deliberately synchronous and lightweight — it only touches the
@@ -63,13 +64,12 @@ void rdp_drive_mount_placeholder(const char *driveName) {
              "This folder is a placeholder for the Windows drive \"%@\" that your\n"
              "RDP client advertised via the MS-RDPEFS protocol.\n"
              "\n"
-             "Current state: handshake complete; drive is enumerated and a\n"
-             "  FileStandardInformation query has been sent to read its size.\n"
+             "Current state: handshake complete; drive is enumerated.\n"
              "\n"
-             "Full read/write mount status: NOT YET IMPLEMENTED\n"
-             "  A real mount requires macFUSE (https://macfuse.github.io) and an\n"
-             "  in-process FUSE server that forwards IRP ops over the rdpdr channel.\n"
-             "  Install macFUSE, then rebuild with -DRDPDR_FUSE_MOUNT=ON (future).\n"
+             "Full read/write mount: coming via Apple File Provider framework\n"
+             "  (NSFileProviderReplicatedExtension) — no brew/macFUSE/kext required.\n"
+             "  The File Provider extension forwards IRP ops (Create, Read, Write,\n"
+             "  QueryDirectory, Close) over the rdpdr WTS channel.\n"
              "\n"
              "For now you can use the RDP session's clipboard to transfer files.\n",
             name, name];
@@ -83,8 +83,7 @@ void rdp_drive_mount_placeholder(const char *driveName) {
                         driveName, writeErr.localizedDescription.UTF8String);
         }
 
-        rdp_info("rdpdr: placeholder created at %s "
-                 "(full FUSE mount requires macFUSE — see README.txt)",
+        rdp_info("rdpdr: placeholder created at %s (File Provider mount in progress)",
                  driveDir.path.UTF8String);
     }
 }

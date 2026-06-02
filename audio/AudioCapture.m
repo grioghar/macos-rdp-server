@@ -420,6 +420,23 @@ static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
     if (outCount) cb(pcm, outCount);
 }
 
+/* Read one interleaved float frame, downmixing to a stereo (L,R) pair. */
+- (void)readFrame:(const float *)in index:(uint32_t)f channels:(uint32_t)ch
+             outL:(float *)outL outR:(float *)outR {
+    const float *frame = in + (size_t)f * ch;
+    if (ch == 1) {
+        *outL = *outR = frame[0];
+    } else if (ch == 2) {
+        *outL = frame[0];
+        *outR = frame[1];
+    } else {
+        /* >2 channels: take 0/1 as L/R (front pair). */
+        *outL = frame[0];
+        *outR = frame[1];
+    }
+}
+
+@end
 
 static OSStatus audio_io_proc(AudioObjectID device, const AudioTimeStamp *now,
                                const AudioBufferList *inputData,

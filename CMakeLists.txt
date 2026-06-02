@@ -83,6 +83,7 @@ add_executable(macos-rdp-daemon
     daemon/Authenticator.m
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
+    daemon/FileProvider/RDPFileProvider.m
     protocol/RDPPeer.c
     protocol/RDPDriveMount.m
     display/VirtualDisplay.m
@@ -119,6 +120,9 @@ target_link_libraries(macos-rdp-daemon PRIVATE
     "-framework IOKit"
     "-framework IOSurface"
     "-framework Security"
+    # FileProvider: NSFileProviderDomain / NSFileProviderManager for RDPDR drive mounting.
+    # Available since macOS 12; deployment target is 14.0 so no weak-link needed.
+    "-framework FileProvider"
     pam
 )
 

@@ -88,11 +88,25 @@ static const uint32_t kDefaultBitrate = 8000;
     _sessionState = RDPSessionStateNegotiating;
     rdp_verbose("RDP negotiation started with %s", _address.UTF8String);
 
+    /* Negotiation watchdog: if the client doesn't complete RDP activation within
+     * kNegotiationTimeoutSecs, drop the connection. Without this, a half-open or
+     * stalled TLS handshake holds the peer for FreeRDP's full 2-minute read timeout,
+     * making every reconnect attempt appear dead to the user. */
+    static const NSTimeInterval kNegotiationTimeoutSecs = 20.0;
+    NSDate *negoDeadline = [NSDate dateWithTimeIntervalSinceNow:kNegotiationTimeoutSecs];
+
     uint32_t lastAudioRate = 0;
     while (_sessionState != RDPSessionStateDisconnecting &&
            _sessionState != RDPSessionStateDisconnected) {
         if (!rdp_peer_run_once(_peer)) {
             rdp_verbose("peer loop ended for %s", _address.UTF8String);
+            break;
+        }
+        /* Abort if still negotiating past the deadline. */
+        if (_sessionState == RDPSessionStateNegotiating &&
+            [[NSDate date] compare:negoDeadline] == NSOrderedDescending) {
+            rdp_info("negotiation timeout (%gs) for %s — dropping stale connection",
+                     kNegotiationTimeoutSecs, _address.UTF8String);
             break;
         }
         /* rdpsnd format negotiation completes asynchronously (Activated callback)

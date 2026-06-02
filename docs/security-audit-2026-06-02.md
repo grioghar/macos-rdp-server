@@ -64,6 +64,25 @@ mounting; the RDPDR protocol layer uses FreeRDP's own rdpdr server API (WITH_RDP
 - Deferred (need hardware test): Authenticator dscl-fallback password in argv (ps-visible),
   FreeRDP credential-string lifetime, VirtualDisplay usleep(400ms) on the session queue.
 
+## D. OpenSSL fork (grioghar/openssl — mirror of openssl-3.6.2)
+
+**Scan date: 2026-06-02. Status: CURRENT — no update required.**
+
+Fork is byte-identical to upstream 3.6.2 (released 2026-04-07); no patches. 3.6.2 is the
+latest in the 3.6.x series (EOL 2026-11-01). All known CVEs up to scan date are already
+fixed in this release:
+
+| CVE | Severity | Impact | Status |
+|---|---|---|---|
+| CVE-2025-15467 | **HIGH** | CMS(Auth)EnvelopedData stack overflow → potential RCE | Fixed in 3.6.1 → in fork |
+| CVE-2025-11187 | Moderate | PKCS#12 PBMAC1 stack overflow / NULL deref | Fixed in 3.6.1 → in fork |
+| CVE-2026-31790 | Moderate | RSA KEM RSASVE uninitialized memory data leak | Fixed in 3.6.2 → in fork |
+| CVE-2026-28386–28390 | Low (×5) | OOB read / NULL deref in AES/DANE/CMS/CRL | Fixed in 3.6.2 → in fork |
+| CVE-2026-31789 | Low | Heap buffer overflow in hex conversion | Fixed in 3.6.2 → in fork |
+
+**Action required:** none. Monitor https://openssl-library.org/news/vulnerabilities/ for 3.6.3+
+before EOL 2026-11-01; update the fork tag when published.
+
 ## Upstream PR commands (run when authed to FreeRDP/FreeRDP)
 ```bash
 # PERF: pre-allocated rdpgfx send buffer

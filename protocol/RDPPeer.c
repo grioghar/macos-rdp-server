@@ -281,21 +281,6 @@ static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
                     list->formats[i].formatId,
                     list->formats[i].formatName ? list->formats[i].formatName : "(none)");
 
-    /* ALL cliprdr SERVER-SENDS are gated OFF by default (RDP_CLIPBOARD=1 to enable).
-     * Any ServerFormat* send (Response/DataRequest/List) intermittently aborts the
-     * daemon inside FreeRDP's cliprdr serializer (WinPR Stream_Write_UINT32 assert) —
-     * the fork is built WITH_VERBOSE_WINPR_ASSERT=ON, so a borderline write that older
-     * builds tolerated now hard-aborts. mstsc advertises its clipboard on every
-     * connect, so this crash-loops the session (client 0x904) and locks the user out.
-     * Until the fork is rebuilt without verbose asserts (the real fix), receive-only:
-     * log the client's formats but send nothing, so the session stays alive. */
-    const char *clipEnabled = getenv("RDP_CLIPBOARD");
-    if (!(clipEnabled && strcmp(clipEnabled, "1") == 0)) {
-        rdp_verbose("clipboard: server-sends disabled (RDP_CLIPBOARD!=1) — receive-only "
-                    "to avoid the cliprdr serializer abort; session stays alive");
-        return CHANNEL_RC_OK;
-    }
-
     /* Acknowledge the advertisement first (msgType is set by the server serializer,
      * but a Format List RESPONSE carries CB_RESPONSE_OK in msgFlags). */
     CLIPRDR_FORMAT_LIST_RESPONSE resp = {0};
@@ -320,6 +305,12 @@ static UINT cliprdr_client_format_list(CliprdrServerContext *cliprdr,
     ctx->clipReqFormat = want;
     CLIPRDR_FORMAT_DATA_REQUEST dreq = {0};
     dreq.common.msgType   = CB_FORMAT_DATA_REQUEST;
+    /* dataLen MUST be 4: FreeRDP's cliprdr_server_format_data_request allocates a
+     * stream of (common.dataLen + 8) and then writes the 4-byte requestedFormatId
+     * AFTER the 8-byte header. With dataLen=0 the stream is exactly the header and
+     * the formatId write runs off the end -> WinPR Stream_Write_UINT32 abort (the
+     * crash that locked the client out on every connect). */
+    dreq.common.dataLen   = 4;
     dreq.requestedFormatId = want;
     rdp_verbose("clipboard: requesting format 0x%08x from client", want);
     cliprdr->ServerFormatDataRequest(cliprdr, &dreq);
@@ -1184,19 +1175,6 @@ bool rdp_peer_send_clipboard(freerdp_peer *peer,
         return true;
     }
 
-    /* Mac->Win advertise (ServerFormatList) is DISABLED BY DEFAULT. It intermittently
-     * aborts the whole daemon inside FreeRDP's cliprdr format-list serializer (WinPR
-     * Stream_Write_UINT32 assert) regardless of formatName="" or handshake gating —
-     * a crash loop that locks the client out (0x904). Win->Mac paste is unaffected
-     * (it uses ServerFormatDataRequest/Response, not ServerFormatList). Until the
-     * serializer crash is root-caused/patched in the fork, gate this behind
-     * RDP_CLIP_MAC2WIN=1 so the daemon stays alive by default. */
-    const char *m2w = getenv("RDP_CLIP_MAC2WIN");
-    if (!(m2w && strcmp(m2w, "1") == 0)) {
-        rdp_verbose("clipboard: Mac->Win advertise OFF (set RDP_CLIP_MAC2WIN=1 to enable); "
-                    "held %zu bytes fmt 0x%08x", len, format);
-        return true;
-    }
 
     /* Advertise the available format; the client requests the bytes on paste.
      *

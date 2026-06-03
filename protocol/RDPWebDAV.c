@@ -282,8 +282,11 @@ static uint16_t le16(const uint8_t *b, uint32_t *off) {
 typedef void (*FfdiVisitor)(const char *name, uint64_t fileSize,
                              uint32_t fileAttrs, void *ud);
 
-static void parse_ffdi(const uint8_t *buf, uint32_t bufLen,
-                        FfdiVisitor visit, void *ud) {
+/* Reserved for callers that want a callback-driven parse; currently the
+ * PROPFIND handler inlines the equivalent logic for locality. */
+static void __attribute__((unused))
+parse_ffdi(const uint8_t *buf, uint32_t bufLen,
+           FfdiVisitor visit, void *ud) {
     uint32_t off = 0;
     while (off + FFDI_FIXED_SIZE <= bufLen) {
         uint32_t startOff = off;

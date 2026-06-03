@@ -7,25 +7,29 @@
  * close the audio-input channel without importing ObjC headers.
  *
  * All functions are no-ops if RDP_AUDIO_INPUT != "1".
+ *
+ * The API takes a HANDLE vcm (VirtualChannelManager from the peer context)
+ * instead of a freerdp_peer* to avoid pulling in freerdp/peer.h — the caller
+ * (RDPPeer.c) already has ctx->vcm and passes it directly.
  */
 
 #include <stdbool.h>
-#include <freerdp/freerdp.h>
-#include <winpr/wtypes.h>   /* HANDLE */
+#include <winpr/wtypes.h>   /* HANDLE, LPSTR */
+#include <winpr/wtsapi.h>   /* WTSVirtualChannelOpen */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * Open the AUDIO_INPUT static virtual channel for the given peer, send the
+ * Open the AUDIO_INPUT static virtual channel using the given VCM, send the
  * MS-RDPEAI VERSION + FORMATS handshake, and start a CoreAudio AudioQueue for
  * Mac speaker playback.
  *
  * Returns an opaque handle on success, NULL on failure or when gated off.
  * The handle is an ARC-retained ObjC object stored as void*.
  */
-void *rdp_audio_input_open(freerdp_peer *peer);
+void *rdp_audio_input_open(HANDLE vcm);
 
 /*
  * Return the WTS channel event handle (for WaitForMultipleObjects in the run
@@ -59,13 +63,11 @@ NS_ASSUME_NONNULL_BEGIN
 
 /*
  * RDPAudioInput — the ObjC implementation backing the C wrappers above.
- *
- * Direct ObjC callers (e.g. tests) may use this interface; production callers
- * should prefer the C wrappers for C-file compatibility.
  */
 @interface RDPAudioInput : NSObject
 
-+ (nullable instancetype)openForPeer:(freerdp_peer *)peer;
+/* Open with the peer's VirtualChannelManager handle (ctx->vcm). */
++ (nullable instancetype)openWithVCM:(HANDLE)vcm;
 - (HANDLE)eventHandle;
 - (void)pump;
 - (void)close;

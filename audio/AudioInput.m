@@ -50,23 +50,13 @@
 
 /* ── Open + negotiate ─────────────────────────────────────────────────── */
 
-+ (nullable instancetype)openForPeer:(freerdp_peer *)peer {
-    if (!peer || !peer->context) return nil;
++ (nullable instancetype)openWithVCM:(HANDLE)vcm {
+    if (!vcm || vcm == INVALID_HANDLE_VALUE) return nil;
 
-    /* Access vcm: RDPPeerContext lays out as { rdpContext base; callbacks; vcm; …}
-     * For the channel open we need the VCM pointer stored in RDPPeerContext.
-     * Rather than including the full struct (circular dependency), we use the
-     * WinPR WTS API which can open a static channel via the peer context pointer. */
-    HANDLE vcm = WTSOpenServerA((LPSTR)peer->context);
-    if (!vcm || vcm == INVALID_HANDLE_VALUE) {
-        rdp_verbose("audio_input: WTSOpenServerA failed");
-        return nil;
-    }
-
+    /* Open the AUDIO_INPUT static virtual channel using the already-open VCM
+     * from the peer context (ctx->vcm in RDPPeer.c). */
     HANDLE ch = WTSVirtualChannelOpen(vcm, WTS_CURRENT_SESSION,
                                       (LPSTR)AI_CHANNEL_NAME);
-    WTSCloseServer(vcm);   /* release our ref — channel stays open */
-
     if (!ch || ch == INVALID_HANDLE_VALUE) {
         rdp_verbose("audio_input: channel '%s' not available "
                     "(client may not have enabled mic redirection)", AI_CHANNEL_NAME);
@@ -283,8 +273,8 @@ static void audio_queue_cb(void *userData, AudioQueueRef queue,
 
 /* ── C-callable wrappers (for RDPPeer.c) ──────────────────────────────── */
 
-void *rdp_audio_input_open(freerdp_peer *peer) {
-    RDPAudioInput *ai = [RDPAudioInput openForPeer:peer];
+void *rdp_audio_input_open(HANDLE vcm) {
+    RDPAudioInput *ai = [RDPAudioInput openWithVCM:vcm];
     if (!ai) return NULL;
     /* Retain the object for the C caller — released in rdp_audio_input_close. */
     return (__bridge_retained void *)ai;

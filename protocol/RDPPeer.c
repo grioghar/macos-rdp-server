@@ -742,9 +742,8 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
     }
 
     /* Audio input (MS-RDPEAI mic redirection). Gated behind RDP_AUDIO_INPUT=1.
-     * Best-effort: if the channel is not available (client did not advertise
-     * mic redirection), openForPeer returns NULL and we continue silently. */
-    ctx->audioInput = rdp_audio_input_open(peer);
+     * Pass ctx->vcm so AudioInput.m never needs to touch the freerdp_peer struct. */
+    ctx->audioInput = rdp_audio_input_open(ctx->vcm);
     if (ctx->audioInput)
         rdp_info("audio_input: channel open");
 

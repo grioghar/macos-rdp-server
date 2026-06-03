@@ -13,11 +13,6 @@ on:
 permissions:
   contents: write   # release job (push to master) needs this to create releases
 
-# Opt into Node.js 24 now so the June 16, 2026 forced migration doesn't break us.
-# Remove once v5 of marketplace actions (checkout, cache, etc.) are released.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-
 jobs:
   build-check:
     name: Compile check (arm64)
@@ -27,7 +22,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Install build tools
         run: |
@@ -40,7 +35,7 @@ jobs:
 
       - name: Cache FreeRDP static build
         id: cache-freerdp
-        uses: actions/cache@v4
+        uses: actions/cache@v5.0.5
         with:
           path: ~/freerdp-install
           key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v8-secfix
@@ -100,7 +95,7 @@ jobs:
           strip -x build/macos-rdp-daemon
 
       - name: Upload arm64 binary (for fast test deploys)
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7.0.1
         with:
           name: macos-rdp-daemon-arm64
           path: build/macos-rdp-daemon
@@ -114,7 +109,7 @@ jobs:
     runs-on: macos-14
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Show Swift version
         run: swift --version
@@ -138,10 +133,10 @@ jobs:
       contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Download arm64 binary artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8.0.1
         with:
           name: macos-rdp-daemon-arm64
           path: dist

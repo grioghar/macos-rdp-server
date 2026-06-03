@@ -110,6 +110,13 @@ struct rdp_peer_context {
      * (WinPR Stream_Write_UINT32 assert). Set true in the client caps/format-list
      * callbacks; gates rdp_peer_send_clipboard. */
     bool                 clipReady;
+    /* AUDIO_INPUT (MS-RDPEAI) mic-redirection channel. Non-NULL only when
+     * RDP_AUDIO_INPUT=1. Stored as void* so this C header stays ObjC-free;
+     * RDPPeer.c casts it through __bridge when handing it to AudioInput.m.
+     * ARC ownership is maintained by the ObjC object itself; the void* here is
+     * a non-owning reference — lifetime is managed by context_free calling
+     * rdp_peer_close_audio_input(), which releases the ObjC object. */
+    void                *audioInput;   /* __strong RDPAudioInput * under ARC */
 };
 
 freerdp_peer *rdp_peer_create(int fd, const RDPPeerCallbacks *callbacks);

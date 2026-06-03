@@ -94,6 +94,7 @@ add_executable(macos-rdp-daemon
     input/InputInjector.m
     input/ClipboardSync.m
     audio/AudioCapture.m
+    audio/AudioInput.m
     audio/AudioRedirect.c
 )
 

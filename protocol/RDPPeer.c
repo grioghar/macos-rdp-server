@@ -2,6 +2,7 @@
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
 #include "protocol/RDPWebDAV.h"
+#include "audio/AudioInput.h"
 
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
@@ -212,6 +213,8 @@ static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
+    /* Audio input (MS-RDPEAI) — close and release the ObjC object. */
+    if (c->audioInput) { rdp_audio_input_close(c->audioInput); c->audioInput = NULL; }
     /* Close rdpdr raw WTS channel (opened when RDP_RDPDR_ENABLED=1). */
     if (c->rdpdrChannel && c->rdpdrChannel != INVALID_HANDLE_VALUE) {
         WTSVirtualChannelClose(c->rdpdrChannel);
@@ -738,6 +741,12 @@ static BOOL peer_post_connect(freerdp_peer *peer) {
         } else { rdp_verbose("audio channel opened (PCM 48000/44100/22050)"); }
     }
 
+    /* Audio input (MS-RDPEAI mic redirection). Gated behind RDP_AUDIO_INPUT=1.
+     * Pass ctx->vcm so AudioInput.m never needs to touch the freerdp_peer struct. */
+    ctx->audioInput = rdp_audio_input_open(ctx->vcm);
+    if (ctx->audioInput)
+        rdp_info("audio_input: channel open");
+
     return TRUE;
 }
 
@@ -890,7 +899,7 @@ void rdp_peer_destroy(freerdp_peer *peer) {
 bool rdp_peer_run_once(freerdp_peer *peer) {
     RDPPeerContext *ctx = (RDPPeerContext *)peer->context;
 
-    HANDLE events[68] = {0};
+    HANDLE events[70] = {0};   /* transport(64) + vcm + gfx + clip + rdpdr + ai_input + spare */
     DWORD  nCount = 0;
 
     /* Peer transport events (typically 1-2 handles). */
@@ -925,6 +934,10 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
 
     /* RDPDR static VC event (only when RDP_RDPDR_ENABLED=1 and channel open). */
     if (ctx->rdpdrEvent) events[nCount++] = ctx->rdpdrEvent;
+
+    /* AUDIO_INPUT channel event (only when RDP_AUDIO_INPUT=1 and channel open). */
+    HANDLE aiEvent = rdp_audio_input_event(ctx->audioInput);
+    if (aiEvent) events[nCount++] = aiEvent;
 
     DWORD status = WaitForMultipleObjects(nCount, events, FALSE, 50 /*ms*/);
     if (status == WAIT_FAILED) {
@@ -997,6 +1010,16 @@ bool rdp_peer_run_once(freerdp_peer *peer) {
     if (ok && ctx->rdpdrEvent &&
         WaitForSingleObject(ctx->rdpdrEvent, 0) == WAIT_OBJECT_0) {
         rdp_peer_pump_rdpdr(peer);
+    }
+
+    /* Drain AUDIO_INPUT DATA PDUs and play on Mac speaker (RDP_AUDIO_INPUT=1).
+     * rdp_audio_input_pump is a read-only drain — no transport writes — so it
+     * does not strictly need xportLock, but we hold it here anyway for a
+     * consistent single-threaded pump discipline (mirrors rdpdr). */
+    if (ok && ctx->audioInput) {
+        if (!aiEvent || WaitForSingleObject(aiEvent, 0) == WAIT_OBJECT_0) {
+            rdp_audio_input_pump(ctx->audioInput);
+        }
     }
 
     pthread_mutex_unlock(&ctx->xportLock);

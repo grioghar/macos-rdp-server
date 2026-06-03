@@ -1,6 +1,7 @@
 #define RDP_LOG_COMPONENT "peer"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+#include "protocol/RDPWebDAV.h"
 
 #include <freerdp/freerdp.h>
 #include <freerdp/listener.h>
@@ -50,22 +51,49 @@
 #ifndef IRP_MJ_CLOSE
 #define IRP_MJ_CLOSE                     0x00000002
 #endif
+#ifndef IRP_MJ_READ
+#define IRP_MJ_READ                      0x00000003
+#endif
+#ifndef IRP_MJ_WRITE
+#define IRP_MJ_WRITE                     0x00000004
+#endif
 #ifndef IRP_MJ_QUERY_INFORMATION
 #define IRP_MJ_QUERY_INFORMATION         0x00000005
+#endif
+#ifndef IRP_MJ_SET_INFORMATION
+#define IRP_MJ_SET_INFORMATION           0x00000006
 #endif
 #ifndef IRP_MJ_DIRECTORY_CONTROL
 #define IRP_MJ_DIRECTORY_CONTROL         0x0000000C
 #endif
 
-/* IRP_MJ_QUERY_INFORMATION information classes — prefixed to avoid collision
- * with WinPR ntioapi.h which may define RDPDR_FileStandardInformation = 5 etc. */
+/* IRP minor functions for IRP_MJ_DIRECTORY_CONTROL */
+#define IRP_MN_QUERY_DIRECTORY           0x00000001
+
+/* PAKID_CORE_DEVICE_IOREQUEST — client-to-server IRP request packet */
+#define PAKID_CORE_DEVICE_IOREQUEST      0x4952
+
+/* IRP_MJ_QUERY_INFORMATION / IRP_MJ_SET_INFORMATION classes */
 #define RDPDR_FileBasicInformation       0x00000004  /* timestamps + attrs */
 #define RDPDR_FileStandardInformation    0x00000005  /* size + allocation */
+#define RDPDR_FileDispositionInformation 0x0000000D  /* mark for deletion */
+#define RDPDR_FileFullDirectoryInformation 0x00000002 /* directory listing */
 
 /* NTSTATUS codes relevant to RDPDR — prefixed to avoid redefinition if WinPR
  * defines the generic STATUS_SUCCESS in its ntstatus.h. */
 #define RDPDR_STATUS_SUCCESS             0x00000000
 #define RDPDR_STATUS_NO_MORE_FILES       0x80000006  /* end of directory listing */
+
+/* IRP_MJ_CREATE access and disposition constants */
+#define RDPDR_GENERIC_READ               0x80000000
+#define RDPDR_GENERIC_WRITE              0x40000000
+#define RDPDR_FILE_OPEN                  0x00000001
+#define RDPDR_FILE_CREATE                0x00000002
+#define RDPDR_FILE_OPEN_IF               0x00000003
+#define RDPDR_FILE_OVERWRITE_IF          0x00000005
+#define RDPDR_FILE_DIRECTORY_FILE        0x00000001
+#define RDPDR_FILE_NON_DIRECTORY_FILE    0x00000040
+#define RDPDR_DELETE_ON_CLOSE            0x00001000
 
 /* Handshake state for the rdpdr channel */
 typedef enum {
@@ -172,6 +200,15 @@ static BOOL context_new(freerdp_peer *peer, rdpContext *ctx) {
 static void context_free(freerdp_peer *peer, rdpContext *ctx) {
     (void)peer;
     RDPPeerContext *c = (RDPPeerContext *)ctx;
+    /* Unmount and destroy WebDAV servers first — they hold a pointer to the peer
+     * which must still be valid when we call destroy. */
+    for (int i = 0; i < RDPDR_MAX_DEVICES; i++) {
+        if (c->webdavServers[i]) {
+            rdp_webdav_unmount(c->webdavServers[i]);
+            rdp_webdav_server_destroy(c->webdavServers[i]);
+            c->webdavServers[i] = NULL;
+        }
+    }
     if (c->gfx)    { rdpgfx_server_context_free(c->gfx);    c->gfx    = NULL; }
     if (c->cliprdr){ cliprdr_server_context_free(c->cliprdr);c->cliprdr= NULL; }
     if (c->rdpsnd) { rdpsnd_server_context_free(c->rdpsnd);  c->rdpsnd = NULL; }
@@ -1372,15 +1409,18 @@ static void rdpdr_send_device_reply(HANDLE ch, uint32_t deviceId, uint32_t resul
 }
 
 /* Allocate the next monotonic IRP request id and store a pending entry.
- * Returns 0 if the pending table is full (drop the request). */
+ * cb may be NULL for fire-and-forget.  Returns 0 if the table is full. */
 static uint32_t rdpdr_alloc_request(RDPPeerContext *ctx,
-                                     uint32_t deviceId, const char *path) {
+                                     uint32_t deviceId, const char *path,
+                                     RDPIrpCallback cb, void *userdata) {
     for (int i = 0; i < RDPDR_MAX_PENDING; i++) {
         if (ctx->rdpdrPending[i].requestId == 0) {
             uint32_t rid = ++ctx->rdpdrNextReqId;
             if (rid == 0) rid = ++ctx->rdpdrNextReqId; /* skip id 0 (sentinel) */
             ctx->rdpdrPending[i].requestId = rid;
             ctx->rdpdrPending[i].deviceId  = deviceId;
+            ctx->rdpdrPending[i].callback  = cb;
+            ctx->rdpdrPending[i].userdata  = userdata;
             strncpy(ctx->rdpdrPending[i].path, path ? path : "",
                     sizeof(ctx->rdpdrPending[i].path) - 1);
             ctx->rdpdrPending[i].path[sizeof(ctx->rdpdrPending[i].path) - 1] = '\0';
@@ -1391,15 +1431,24 @@ static uint32_t rdpdr_alloc_request(RDPPeerContext *ctx,
     return 0;
 }
 
-/* Free a slot in the pending table by request id.
+/* Free a slot in the pending table by request id and invoke its callback.
+ * payload/payloadLen are the bytes following the IOCOMPLETION fixed header.
  * Returns the device id associated with the request, or 0 if not found. */
-static uint32_t rdpdr_free_request(RDPPeerContext *ctx, uint32_t requestId) {
+static uint32_t rdpdr_free_request(RDPPeerContext *ctx, uint32_t requestId,
+                                    uint32_t ioStatus,
+                                    const uint8_t *payload, uint32_t payloadLen) {
     for (int i = 0; i < RDPDR_MAX_PENDING; i++) {
         if (ctx->rdpdrPending[i].requestId == requestId) {
-            uint32_t devId = ctx->rdpdrPending[i].deviceId;
+            uint32_t       devId = ctx->rdpdrPending[i].deviceId;
+            RDPIrpCallback cb    = ctx->rdpdrPending[i].callback;
+            void          *ud    = ctx->rdpdrPending[i].userdata;
             rdp_verbose("rdpdr: IRP completion for requestId=%u dev=%u path=\"%s\"",
                         requestId, devId, ctx->rdpdrPending[i].path);
             ctx->rdpdrPending[i].requestId = 0;
+            ctx->rdpdrPending[i].callback  = NULL;
+            ctx->rdpdrPending[i].userdata  = NULL;
+            /* Invoke callback AFTER zeroing the slot so re-entrant alloc is safe. */
+            if (cb) cb(ioStatus, payload, payloadLen, ud);
             return devId;
         }
     }
@@ -1419,18 +1468,18 @@ static uint32_t rdpdr_free_request(RDPPeerContext *ctx, uint32_t requestId) {
  * MS-RDPEFS §2.2.3.4.9  DR_DRIVE_QUERY_INFORMATION_RSP
  */
 static bool rdpdr_send_query_info_req(RDPPeerContext *ctx, uint32_t deviceId) {
-    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, "\\");
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, "\\", NULL, NULL);
     if (rid == 0) return false;
 
     /* Header(4) + DeviceId(4) + FileId(4) + CompletionId(4) +
      * MajorFunction(4) + MinorFunction(4) + Padding(20) = IRP header 44 bytes
      * + FsInformationClass(4) + Padding(4) = 52 bytes total */
     wStream *s = Stream_New(NULL, 52);
-    if (!s) { rdpdr_free_request(ctx, rid); return false; }
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
 
     /* Packet header */
     Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
-    Stream_Write_UINT16(s, 0x4952); /* PAKID_CORE_DEVICE_IOREQUEST */
+    Stream_Write_UINT16(s, PAKID_CORE_DEVICE_IOREQUEST);
 
     /* DR_IRP_REQ — MS-RDPEFS §2.2.1.4 */
     Stream_Write_UINT32(s, deviceId);
@@ -1455,7 +1504,241 @@ static bool rdpdr_send_query_info_req(RDPPeerContext *ctx, uint32_t deviceId) {
         rdp_verbose("rdpdr: -> QUERY_INFORMATION_REQ (dev=%u rid=%u "
                     "RDPDR_FileStandardInformation)", deviceId, rid);
     else
-        rdpdr_free_request(ctx, rid);
+        rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    return ok;
+}
+
+/* ── IRP send helpers ─────────────────────────────────────────────────────
+ *
+ * Each helper builds the standard DR_IRP_REQ header (MS-RDPEFS §2.2.1.4):
+ *   Packet header  : RDPDR_CTYP_CORE(2) + PAKID_CORE_DEVICE_IOREQUEST(2)
+ *   IRP body header: DeviceId(4) + FileId(4) + CompletionId(4) +
+ *                    MajorFunction(4) + MinorFunction(4) + Padding(20)
+ * Total fixed header = 4 + 40 = 44 bytes before the specific body.
+ *
+ * ALL helpers must be called under xportLock.
+ * cb may be NULL for fire-and-forget requests.
+ */
+
+/* Write the common 44-byte IRP header into stream s. */
+static void rdpdr_write_irp_header(wStream *s, uint32_t deviceId,
+                                    uint32_t fileId, uint32_t rid,
+                                    uint32_t majorFn, uint32_t minorFn) {
+    Stream_Write_UINT16(s, RDPDR_CTYP_CORE);
+    Stream_Write_UINT16(s, PAKID_CORE_DEVICE_IOREQUEST);
+    Stream_Write_UINT32(s, deviceId);
+    Stream_Write_UINT32(s, fileId);
+    Stream_Write_UINT32(s, rid);
+    Stream_Write_UINT32(s, majorFn);
+    Stream_Write_UINT32(s, minorFn);
+    /* 20 bytes of padding (5 x uint32 = 0x00 filler per spec). */
+    Stream_Write_UINT32(s, 0); Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0); Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT32(s, 0);
+}
+
+/* IRP_MJ_CREATE — open a file or directory.
+ * path is UTF-8, no leading slash; internally converted to UTF-16LE. */
+bool rdpdr_send_create_req(RDPPeerContext *ctx, uint32_t deviceId,
+                            const char *path,
+                            uint32_t desiredAccess,
+                            uint32_t createDisposition,
+                            uint32_t createOptions,
+                            RDPIrpCallback cb, void *userdata) {
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, path, cb, userdata);
+    if (rid == 0) return false;
+
+    /* Convert path to UTF-16LE. */
+    size_t pathLen = path ? strlen(path) : 0;
+    /* Max path: 260 chars → 520 bytes UTF-16 + 2 for NUL. */
+    uint16_t utf16[261];
+    uint32_t utf16Len = 0;
+    for (size_t i = 0; i < pathLen && i < 260; i++) {
+        /* Simple ASCII->UTF-16LE (rdpdr paths are drive-relative ASCII). */
+        utf16[utf16Len++] = (uint16_t)(unsigned char)path[i];
+    }
+    uint32_t pathBytes = utf16Len * 2; /* byte count sent on wire (no NUL) */
+
+    /* DR_CREATE_REQ body (MS-RDPEFS §2.2.3.3.1):
+     *   DesiredAccess(4) + AllocationSize(8) + FileAttributes(4) +
+     *   ShareAccess(4) + CreateDisposition(4) + CreateOptions(4) +
+     *   PathLength(4) + Path(PathLength) */
+    size_t totalSize = 44 + 32 + pathBytes;
+    wStream *s = Stream_New(NULL, totalSize);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, 0, rid, IRP_MJ_CREATE, 0);
+    Stream_Write_UINT32(s, desiredAccess);
+    Stream_Write_UINT64(s, 0);            /* AllocationSize = 0 */
+    Stream_Write_UINT32(s, 0);            /* FileAttributes = normal */
+    Stream_Write_UINT32(s, 3);            /* ShareAccess = read|write */
+    Stream_Write_UINT32(s, createDisposition);
+    Stream_Write_UINT32(s, createOptions);
+    Stream_Write_UINT32(s, pathBytes);
+    for (uint32_t i = 0; i < utf16Len; i++) Stream_Write_UINT16(s, utf16[i]);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> CREATE_REQ dev=%u rid=%u path=\"%s\"",
+                     deviceId, rid, path ? path : "");
+    return ok;
+}
+
+/* IRP_MJ_CLOSE — close a file handle. */
+bool rdpdr_send_close_req(RDPPeerContext *ctx, uint32_t deviceId,
+                           uint32_t fileId,
+                           RDPIrpCallback cb, void *userdata) {
+    char label[32];
+    snprintf(label, sizeof(label), "close(%u)", fileId);
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* DR_CLOSE_REQ body: just 32 bytes of padding after the IRP header. */
+    wStream *s = Stream_New(NULL, 44 + 32);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_CLOSE, 0);
+    /* 32 bytes Padding */
+    for (int i = 0; i < 8; i++) Stream_Write_UINT32(s, 0);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> CLOSE_REQ dev=%u fileId=%u rid=%u",
+                     deviceId, fileId, rid);
+    return ok;
+}
+
+/* IRP_MJ_READ — read bytes from an open file. */
+bool rdpdr_send_read_req(RDPPeerContext *ctx, uint32_t deviceId,
+                          uint32_t fileId, uint64_t offset, uint32_t length,
+                          RDPIrpCallback cb, void *userdata) {
+    char label[32];
+    snprintf(label, sizeof(label), "read(%u)", fileId);
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* DR_READ_REQ body (MS-RDPEFS §2.2.3.3.3):
+     *   Length(4) + Offset(8) + Padding(20) */
+    wStream *s = Stream_New(NULL, 44 + 32);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_READ, 0);
+    Stream_Write_UINT32(s, length);
+    Stream_Write_UINT64(s, offset);
+    /* Padding: 20 bytes (5 x uint32) */
+    for (int i = 0; i < 5; i++) Stream_Write_UINT32(s, 0);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> READ_REQ dev=%u fileId=%u off=%llu len=%u rid=%u",
+                     deviceId, fileId, (unsigned long long)offset, length, rid);
+    return ok;
+}
+
+/* IRP_MJ_WRITE — write bytes to an open file. */
+bool rdpdr_send_write_req(RDPPeerContext *ctx, uint32_t deviceId,
+                           uint32_t fileId, uint64_t offset,
+                           const uint8_t *data, uint32_t length,
+                           RDPIrpCallback cb, void *userdata) {
+    char label[32];
+    snprintf(label, sizeof(label), "write(%u)", fileId);
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* DR_WRITE_REQ body (MS-RDPEFS §2.2.3.3.4):
+     *   Length(4) + Offset(8) + Padding(20) + WriteData(Length) */
+    wStream *s = Stream_New(NULL, 44 + 32 + length);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_WRITE, 0);
+    Stream_Write_UINT32(s, length);
+    Stream_Write_UINT64(s, offset);
+    for (int i = 0; i < 5; i++) Stream_Write_UINT32(s, 0); /* padding */
+    if (length > 0 && data) Stream_Write(s, data, length);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> WRITE_REQ dev=%u fileId=%u off=%llu len=%u rid=%u",
+                     deviceId, fileId, (unsigned long long)offset, length, rid);
+    return ok;
+}
+
+/* IRP_MJ_DIRECTORY_CONTROL / IRP_MN_QUERY_DIRECTORY — list a directory.
+ * pattern is the search pattern (e.g. "*"); informationClass is
+ * FileFullDirectoryInformation (2). */
+bool rdpdr_send_query_dir_req(RDPPeerContext *ctx, uint32_t deviceId,
+                               uint32_t fileId, const char *pattern,
+                               RDPIrpCallback cb, void *userdata) {
+    char label[64];
+    snprintf(label, sizeof(label), "querydir(%u,%s)", fileId,
+             pattern ? pattern : "*");
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* Convert pattern to UTF-16LE */
+    const char *pat = pattern ? pattern : "*";
+    size_t patLen = strlen(pat);
+    uint16_t utf16[261];
+    uint32_t utf16Len = 0;
+    for (size_t i = 0; i < patLen && i < 260; i++)
+        utf16[utf16Len++] = (uint16_t)(unsigned char)pat[i];
+    uint32_t patBytes = utf16Len * 2;
+
+    /* DR_DRIVE_QUERY_DIRECTORY_REQ (MS-RDPEFS §2.2.3.3.10):
+     *   FsInformationClass(4) + InitialQuery(1) + PathLength(4) + Padding(23) + Path */
+    size_t bodySize = 4 + 1 + 4 + 23 + patBytes;
+    wStream *s = Stream_New(NULL, 44 + bodySize);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid,
+                            IRP_MJ_DIRECTORY_CONTROL, IRP_MN_QUERY_DIRECTORY);
+    Stream_Write_UINT32(s, RDPDR_FileFullDirectoryInformation);
+    Stream_Write_UINT8(s,  1);           /* InitialQuery = 1 (restart scan) */
+    Stream_Write_UINT32(s, patBytes);
+    /* 23 bytes padding */
+    for (int i = 0; i < 5; i++) Stream_Write_UINT32(s, 0);
+    Stream_Write_UINT8(s, 0);            /* last padding byte */
+    /* Path */
+    for (uint32_t i = 0; i < utf16Len; i++) Stream_Write_UINT16(s, utf16[i]);
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> QUERY_DIR_REQ dev=%u fileId=%u pat=\"%s\" rid=%u",
+                     deviceId, fileId, pat, rid);
+    return ok;
+}
+
+/* IRP_MJ_SET_INFORMATION (FileDispositionInformation) — mark file for deletion. */
+bool rdpdr_send_delete_req(RDPPeerContext *ctx, uint32_t deviceId,
+                            uint32_t fileId,
+                            RDPIrpCallback cb, void *userdata) {
+    char label[32];
+    snprintf(label, sizeof(label), "delete(%u)", fileId);
+    uint32_t rid = rdpdr_alloc_request(ctx, deviceId, label, cb, userdata);
+    if (rid == 0) return false;
+
+    /* DR_SET_INFORMATION_REQ body (MS-RDPEFS §2.2.3.3.9):
+     *   FsInformationClass(4) + Length(4) + Padding(24) + SetBuffer(Length)
+     * FileDispositionInformation body: DeleteFile(1) = 1. */
+    wStream *s = Stream_New(NULL, 44 + 4 + 4 + 24 + 1);
+    if (!s) { rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0); return false; }
+
+    rdpdr_write_irp_header(s, deviceId, fileId, rid, IRP_MJ_SET_INFORMATION, 0);
+    Stream_Write_UINT32(s, RDPDR_FileDispositionInformation);
+    Stream_Write_UINT32(s, 1);   /* Length of SetBuffer = 1 byte */
+    for (int i = 0; i < 6; i++) Stream_Write_UINT32(s, 0); /* 24 bytes padding */
+    Stream_Write_UINT8(s,  1);   /* DeleteFile = TRUE */
+
+    bool ok = rdpdr_write_pdu(ctx->rdpdrChannel, s);
+    Stream_Free(s, TRUE);
+    if (!ok) rdpdr_free_request(ctx, rid, 0xC0000000, NULL, 0);
+    else rdp_verbose("rdpdr: -> DELETE_REQ dev=%u fileId=%u rid=%u",
+                     deviceId, fileId, rid);
     return ok;
 }
 
@@ -1543,6 +1826,9 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
         Stream_Read_UINT32(s, deviceCount);
         rdp_info("rdpdr: <- DEVICE_LIST_ANNOUNCE — %u device(s)", (unsigned)deviceCount);
 
+        /* Track how many drive slots we have filled so we can index webdavServers. */
+        int driveSlot = 0;
+
         for (UINT32 i = 0; i < deviceCount; i++) {
             if (Stream_GetRemainingLength(s) < 20) break;
             UINT32 devType, devId, dataLen;
@@ -1566,16 +1852,41 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
 
             if (devType == RDPDR_DTYP_FILESYSTEM) {
                 rdp_info("rdpdr: client drive #%u — id=%u name=\"%s\" "
-                         "(placeholder on Desktop; File Provider mount in progress)",
+                         "(starting embedded WebDAV server for Finder mount)",
                          (unsigned)i, (unsigned)devId, dosName);
-                /* Create a Desktop placeholder folder so the user has visible
-                 * feedback that the drive was redirected. A full read/write mount
-                 * is being implemented using Apple's File Provider framework
-                 * (NSFileProviderReplicatedExtension) — no macFUSE/brew/kext needed. */
+
+                /* Desktop placeholder for immediate user feedback. */
                 rdp_drive_mount_placeholder(dosName, devId);
-                /* Send a RDPDR_FileStandardInformation query to get the drive's
-                 * allocation size. The completion is logged in
-                 * PAKID_CORE_DEVICE_IOCOMPLETION below. */
+
+                /* Start an embedded WebDAV server and mount via mount_webdav. */
+                if (driveSlot < RDPDR_MAX_DEVICES) {
+                    /* Ports 8760..8767 — one per drive slot. */
+                    uint16_t port = (uint16_t)(8760 + (driveSlot % 100));
+                    /* Must release xportLock before calling server_create which
+                     * calls pthread_create and may need to call back into IRPs.
+                     * ctx->base.peer is the owning freerdp_peer pointer. */
+                    freerdp_peer *peerPtr = ctx->base.peer;
+                    pthread_mutex_unlock(&ctx->xportLock);
+                    RDPWebDAVServer *srv =
+                        rdp_webdav_server_create(peerPtr, devId, dosName, port);
+                    pthread_mutex_lock(&ctx->xportLock);
+
+                    if (srv) {
+                        ctx->webdavServers[driveSlot] = srv;
+                        rdp_webdav_mount(srv);
+                        rdp_info("rdpdr: WebDAV server started on port %u for drive \"%s\"",
+                                 (unsigned)port, dosName);
+                    } else {
+                        rdp_error("rdpdr: failed to start WebDAV server for drive \"%s\"",
+                                  dosName);
+                    }
+                    driveSlot++;
+                } else {
+                    rdp_verbose("rdpdr: no free WebDAV server slots for drive \"%s\"",
+                                dosName);
+                }
+
+                /* Fire-and-forget probe to log drive capacity. */
                 rdpdr_send_query_info_req(ctx, devId);
             } else {
                 rdp_verbose("rdpdr: client device #%u — id=%u name=\"%s\" type=%s (not a drive)",
@@ -1606,8 +1917,15 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
         Stream_Read_UINT32(s, completionId);
         Stream_Read_UINT32(s, ioStatus);
 
-        /* Look up the pending request to give context to the log. */
-        uint32_t matchedDev = rdpdr_free_request(ctx, completionId);
+        /* Grab the payload bytes before we call rdpdr_free_request (which invokes
+         * the callback that might use them).  The stream is stack-allocated over
+         * the original read buffer, so the pointer is valid during this call. */
+        const uint8_t *payload    = Stream_Pointer(s);
+        uint32_t       payloadLen = (uint32_t)Stream_GetRemainingLength(s);
+
+        /* Look up the pending request, invoke its callback, and free the slot. */
+        uint32_t matchedDev = rdpdr_free_request(ctx, completionId,
+                                                  ioStatus, payload, payloadLen);
         if (matchedDev == 0) {
             /* Could be an unsolicited completion for a request we didn't send
              * (e.g. the client proactively sending info). Log and ignore. */
@@ -1617,29 +1935,8 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
             break;
         }
 
-        if (ioStatus != RDPDR_STATUS_SUCCESS) {
-            rdp_verbose("rdpdr: IOCOMPLETION dev=%u cid=%u status=0x%08x (error)",
-                        devId, completionId, ioStatus);
-            break;
-        }
-
-        /* Remaining bytes are the response payload. For RDPDR_FileStandardInformation
-         * the payload is FILE_STANDARD_INFORMATION (24 bytes):
-         *   AllocationSize(8) + EndOfFile(8) + NumberOfLinks(4) +
-         *   DeletePending(1) + Directory(1) + pad(2). */
-        if (Stream_GetRemainingLength(s) >= 24) {
-            UINT64 allocSize = 0, endOfFile = 0;
-            Stream_Read_UINT64(s, allocSize);
-            Stream_Read_UINT64(s, endOfFile);
-            rdp_info("rdpdr: IOCOMPLETION dev=%u — RDPDR_FileStandardInformation: "
-                     "alloc=%llu bytes, size=%llu bytes",
-                     devId, (unsigned long long)allocSize,
-                     (unsigned long long)endOfFile);
-        } else {
-            rdp_verbose("rdpdr: IOCOMPLETION dev=%u cid=%u status=SUCCESS "
-                        "(payload %zu bytes, not parsed)",
-                        devId, completionId, Stream_GetRemainingLength(s));
-        }
+        rdp_verbose("rdpdr: IOCOMPLETION dev=%u cid=%u status=0x%08x payload=%u bytes",
+                    devId, completionId, ioStatus, payloadLen);
         break;
     }
 

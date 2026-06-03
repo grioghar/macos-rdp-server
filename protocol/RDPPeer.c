@@ -174,6 +174,12 @@ static void peer_apply_settings(freerdp_peer *peer) {
     freerdp_settings_set_bool(s,   FreeRDP_HasHorizontalWheel,      TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_HasExtendedMouseEvent,   TRUE);
     freerdp_settings_set_bool(s,   FreeRDP_SoundBeepsEnabled,       FALSE);
+    /* Accept multi-monitor connections: client may send monitor layout data
+     * (e.g. "Use all my monitors" in mstsc). We create one virtual display
+     * sized to the combined DesktopWidth × DesktopHeight, which covers both
+     * the span case and the independent-monitor case from the server's side. */
+    freerdp_settings_set_bool(s,   FreeRDP_UseMultimon,             TRUE);
+    freerdp_settings_set_bool(s,   FreeRDP_SupportMonitorLayoutPdu, TRUE);
 
     peer_load_certificate(peer);
     rdp_debug("peer settings applied");

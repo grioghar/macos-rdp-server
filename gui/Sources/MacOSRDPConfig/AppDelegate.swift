@@ -22,6 +22,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rdpdrEnabledItem: NSMenuItem!
     // Audio
     private var audioLocalItem: NSMenuItem!
+    private var audioInputItem: NSMenuItem!
     // Logging
     private var logDebugItem: NSMenuItem!
 
@@ -120,6 +121,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioLocalItem.target = self
         menu.addItem(audioLocalItem)
 
+        audioInputItem = NSMenuItem(title: "Receive mic input from Windows client",
+                                    action: #selector(toggleAudioInput),
+                                    keyEquivalent: "")
+        audioInputItem.target = self
+        menu.addItem(audioInputItem)
+
         menu.addItem(.separator())
 
         // ── Logging ───────────────────────────────────────────────────────
@@ -180,6 +187,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rdpdrEnabledItem.state  = (env[AgentController.EnvKey.rdpdrEnabled] == "1") ? .on : .off
             // RDP_AUDIO_LOCAL: "1" = both local+remote (default), "0" = remote only
             audioLocalItem.state    = (env[AgentController.EnvKey.audioLocal] != "0") ? .on : .off
+            audioInputItem.state    = (env[AgentController.EnvKey.audioInput]  == "1") ? .on : .off
             let level = (env[AgentController.EnvKey.logLevel] ?? "info").lowercased()
             logDebugItem.state      = (level == "debug" || level == "verbose") ? .on : .off
             setOptionItems(enabled: true)
@@ -190,6 +198,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             privacyBlankItem.state  = .off
             rdpdrEnabledItem.state  = .off
             audioLocalItem.state    = .off
+            audioInputItem.state    = .off
             logDebugItem.state      = .off
             setOptionItems(enabled: false)
         }
@@ -202,6 +211,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         privacyBlankItem.isEnabled = enabled
         rdpdrEnabledItem.isEnabled = enabled
         audioLocalItem.isEnabled   = enabled
+        audioInputItem.isEnabled   = enabled
         logDebugItem.isEnabled     = enabled
     }
 
@@ -244,6 +254,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // RDP_AUDIO_LOCAL=1 means play on local speakers too; 0 = remote only
         let newValue = (audioLocalItem.state == .on) ? "0" : "1"
         setOptionAndReload(key: AgentController.EnvKey.audioLocal, value: newValue)
+    }
+
+    @objc private func toggleAudioInput() {
+        // RDP_AUDIO_INPUT=1 enables receiving mic audio from the Windows client
+        let newValue = (audioInputItem.state == .on) ? "0" : "1"
+        setOptionAndReload(key: AgentController.EnvKey.audioInput, value: newValue)
     }
 
     @objc private func toggleLogLevel() {

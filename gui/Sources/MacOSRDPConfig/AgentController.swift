@@ -46,6 +46,7 @@ struct AgentController {
         static let privacyBlank  = "RDP_PRIVACY_BLANK"
         static let rdpdrEnabled  = "RDP_RDPDR_ENABLED"
         static let audioLocal    = "RDP_AUDIO_LOCAL"
+        static let audioInput    = "RDP_AUDIO_INPUT"
         static let logLevel      = "RDP_LOG_LEVEL"
     }
 

@@ -65,18 +65,15 @@ void rdp_drive_mount_placeholder(const char *driveName, uint32_t deviceId) {
         NSString *info = [NSString stringWithFormat:
             @"RDP Drive Redirection — %@\n"
              "\n"
-             "This folder is a placeholder for the Windows drive \"%@\" that your\n"
-             "RDP client advertised via the MS-RDPEFS protocol.\n"
+             "The Windows drive \"%@\" is redirected via MS-RDPEFS.\n"
              "\n"
-             "Current state: handshake complete; drive is enumerated.\n"
+             "Access it at: /Volumes/RDP-%@ (mounted via WebDAV)\n"
+             "  Open Finder → Go → /Volumes/RDP-%@, or browse it in Finder's\n"
+             "  sidebar under Network. Read and write work; the WebDAV bridge\n"
+             "  translates every file op into an IRP sent to the Windows client.\n"
              "\n"
-             "Full read/write mount: coming via Apple File Provider framework\n"
-             "  (NSFileProviderReplicatedExtension) — no brew/macFUSE/kext required.\n"
-             "  The File Provider extension forwards IRP ops (Create, Read, Write,\n"
-             "  QueryDirectory, Close) over the rdpdr WTS channel.\n"
-             "\n"
-             "For now you can use the RDP session's clipboard to transfer files.\n",
-            name, name];
+             "This Desktop folder is just a marker — use /Volumes/RDP-%@ instead.\n",
+            name, name, name.uppercaseString, name.uppercaseString, name.uppercaseString];
 
         NSError *writeErr = nil;
         if (![info writeToURL:infoFile

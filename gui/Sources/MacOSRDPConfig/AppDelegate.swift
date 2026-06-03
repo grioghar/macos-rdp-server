@@ -2,8 +2,8 @@ import AppKit
 
 /// Menu-bar (NSStatusItem) controller for the macOS RDP daemon. Shows daemon
 /// status, lets the user start/stop it, and toggles the EnvironmentVariables
-/// options the daemon reads (RDP_SHOW_CURSOR, RDP_SHARED_MODE, RDP_LOG_LEVEL),
-/// reloading the agent after a change so the new settings take effect.
+/// options the daemon reads. Changes write to the LaunchAgent plist and reload
+/// the daemon so settings take effect on the next connection.
 final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var statusItem: NSStatusItem!
@@ -13,8 +13,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusMenuItem: NSMenuItem!
     private var startItem: NSMenuItem!
     private var stopItem: NSMenuItem!
+    // Video
     private var showCursorItem: NSMenuItem!
+    private var cursorShapesItem: NSMenuItem!
     private var sharedModeItem: NSMenuItem!
+    private var privacyBlankItem: NSMenuItem!
+    // Drives
+    private var rdpdrEnabledItem: NSMenuItem!
+    // Audio
+    private var audioLocalItem: NSMenuItem!
+    // Logging
     private var logDebugItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -57,23 +65,69 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let optionsHeader = NSMenuItem(title: "Options", action: nil, keyEquivalent: "")
-        optionsHeader.isEnabled = false
-        menu.addItem(optionsHeader)
+        // ── Video ─────────────────────────────────────────────────────────
+        let videoHeader = NSMenuItem(title: "Video", action: nil, keyEquivalent: "")
+        videoHeader.isEnabled = false
+        menu.addItem(videoHeader)
 
-        showCursorItem = NSMenuItem(title: "Show macOS cursor in video",
+        showCursorItem = NSMenuItem(title: "Show macOS cursor overlay in video",
                                     action: #selector(toggleShowCursor),
                                     keyEquivalent: "")
         showCursorItem.target = self
         menu.addItem(showCursorItem)
 
-        sharedModeItem = NSMenuItem(title: "Shared mode (desk + remote at once)",
+        cursorShapesItem = NSMenuItem(title: "Stream cursor shapes to client",
+                                      action: #selector(toggleCursorShapes),
+                                      keyEquivalent: "")
+        cursorShapesItem.target = self
+        menu.addItem(cursorShapesItem)
+
+        sharedModeItem = NSMenuItem(title: "Shared mode (local + remote see same screen)",
                                     action: #selector(toggleSharedMode),
                                     keyEquivalent: "")
         sharedModeItem.target = self
         menu.addItem(sharedModeItem)
 
-        logDebugItem = NSMenuItem(title: "Verbose logging (debug)",
+        privacyBlankItem = NSMenuItem(title: "Privacy blank local display on connect",
+                                      action: #selector(togglePrivacyBlank),
+                                      keyEquivalent: "")
+        privacyBlankItem.target = self
+        menu.addItem(privacyBlankItem)
+
+        menu.addItem(.separator())
+
+        // ── Drives ────────────────────────────────────────────────────────
+        let drivesHeader = NSMenuItem(title: "Drives", action: nil, keyEquivalent: "")
+        drivesHeader.isEnabled = false
+        menu.addItem(drivesHeader)
+
+        rdpdrEnabledItem = NSMenuItem(title: "Enable Windows drive redirection",
+                                      action: #selector(toggleRdpdr),
+                                      keyEquivalent: "")
+        rdpdrEnabledItem.target = self
+        menu.addItem(rdpdrEnabledItem)
+
+        menu.addItem(.separator())
+
+        // ── Audio ─────────────────────────────────────────────────────────
+        let audioHeader = NSMenuItem(title: "Audio", action: nil, keyEquivalent: "")
+        audioHeader.isEnabled = false
+        menu.addItem(audioHeader)
+
+        audioLocalItem = NSMenuItem(title: "Also play audio on local Mac speakers",
+                                    action: #selector(toggleAudioLocal),
+                                    keyEquivalent: "")
+        audioLocalItem.target = self
+        menu.addItem(audioLocalItem)
+
+        menu.addItem(.separator())
+
+        // ── Logging ───────────────────────────────────────────────────────
+        let loggingHeader = NSMenuItem(title: "Logging", action: nil, keyEquivalent: "")
+        loggingHeader.isEnabled = false
+        menu.addItem(loggingHeader)
+
+        logDebugItem = NSMenuItem(title: "Verbose logging (debug/verbose)",
                                   action: #selector(toggleLogLevel),
                                   keyEquivalent: "")
         logDebugItem.target = self
@@ -119,23 +173,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // unchecked but enabled so the user can attempt to set them.
         switch AgentController.readEnvironment() {
         case let .success(env):
-            showCursorItem.state = (env[AgentController.EnvKey.showCursor] == "1") ? .on : .off
-            sharedModeItem.state = (env[AgentController.EnvKey.sharedMode] == "1") ? .on : .off
+            showCursorItem.state    = (env[AgentController.EnvKey.showCursor]   == "1") ? .on : .off
+            cursorShapesItem.state  = (env[AgentController.EnvKey.cursorShapes] == "1") ? .on : .off
+            sharedModeItem.state    = (env[AgentController.EnvKey.sharedMode]   == "1") ? .on : .off
+            privacyBlankItem.state  = (env[AgentController.EnvKey.privacyBlank] == "1") ? .on : .off
+            rdpdrEnabledItem.state  = (env[AgentController.EnvKey.rdpdrEnabled] == "1") ? .on : .off
+            // RDP_AUDIO_LOCAL: "1" = both local+remote (default), "0" = remote only
+            audioLocalItem.state    = (env[AgentController.EnvKey.audioLocal] != "0") ? .on : .off
             let level = (env[AgentController.EnvKey.logLevel] ?? "info").lowercased()
-            logDebugItem.state = (level == "debug" || level == "verbose") ? .on : .off
+            logDebugItem.state      = (level == "debug" || level == "verbose") ? .on : .off
             setOptionItems(enabled: true)
         case .failure:
-            showCursorItem.state = .off
-            sharedModeItem.state = .off
-            logDebugItem.state = .off
+            showCursorItem.state    = .off
+            cursorShapesItem.state  = .off
+            sharedModeItem.state    = .off
+            privacyBlankItem.state  = .off
+            rdpdrEnabledItem.state  = .off
+            audioLocalItem.state    = .off
+            logDebugItem.state      = .off
             setOptionItems(enabled: false)
         }
     }
 
     private func setOptionItems(enabled: Bool) {
-        showCursorItem.isEnabled = enabled
-        sharedModeItem.isEnabled = enabled
-        logDebugItem.isEnabled = enabled
+        showCursorItem.isEnabled   = enabled
+        cursorShapesItem.isEnabled = enabled
+        sharedModeItem.isEnabled   = enabled
+        privacyBlankItem.isEnabled = enabled
+        rdpdrEnabledItem.isEnabled = enabled
+        audioLocalItem.isEnabled   = enabled
+        logDebugItem.isEnabled     = enabled
     }
 
     // MARK: Actions
@@ -153,9 +220,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setOptionAndReload(key: AgentController.EnvKey.showCursor, value: newValue)
     }
 
+    @objc private func toggleCursorShapes() {
+        let newValue = (cursorShapesItem.state == .on) ? "0" : "1"
+        setOptionAndReload(key: AgentController.EnvKey.cursorShapes, value: newValue)
+    }
+
     @objc private func toggleSharedMode() {
         let newValue = (sharedModeItem.state == .on) ? "0" : "1"
         setOptionAndReload(key: AgentController.EnvKey.sharedMode, value: newValue)
+    }
+
+    @objc private func togglePrivacyBlank() {
+        let newValue = (privacyBlankItem.state == .on) ? "0" : "1"
+        setOptionAndReload(key: AgentController.EnvKey.privacyBlank, value: newValue)
+    }
+
+    @objc private func toggleRdpdr() {
+        let newValue = (rdpdrEnabledItem.state == .on) ? "0" : "1"
+        setOptionAndReload(key: AgentController.EnvKey.rdpdrEnabled, value: newValue)
+    }
+
+    @objc private func toggleAudioLocal() {
+        // RDP_AUDIO_LOCAL=1 means play on local speakers too; 0 = remote only
+        let newValue = (audioLocalItem.state == .on) ? "0" : "1"
+        setOptionAndReload(key: AgentController.EnvKey.audioLocal, value: newValue)
     }
 
     @objc private func toggleLogLevel() {

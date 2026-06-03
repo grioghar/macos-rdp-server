@@ -40,9 +40,13 @@ struct AgentController {
     /// daemon/main.m reads RDP_LOG_LEVEL; RDP_SHARED_MODE is added by parallel
     /// work and read by the daemon's shared-mode path).
     enum EnvKey {
-        static let showCursor  = "RDP_SHOW_CURSOR"
-        static let sharedMode  = "RDP_SHARED_MODE"
-        static let logLevel    = "RDP_LOG_LEVEL"
+        static let showCursor    = "RDP_SHOW_CURSOR"
+        static let cursorShapes  = "RDP_CURSOR_SHAPES"
+        static let sharedMode    = "RDP_SHARED_MODE"
+        static let privacyBlank  = "RDP_PRIVACY_BLANK"
+        static let rdpdrEnabled  = "RDP_RDPDR_ENABLED"
+        static let audioLocal    = "RDP_AUDIO_LOCAL"
+        static let logLevel      = "RDP_LOG_LEVEL"
     }
 
     // MARK: Process helper

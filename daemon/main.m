@@ -147,7 +147,6 @@ int main(int argc, char *argv[]) {
         });
 
         struct kevent got;
-        struct timespec zero = {0, 0};
         while (1) {
             int n = kevent(kq, NULL, 0, &got, 1, NULL); /* blocks until signal */
             if (n > 0 && (got.ident == SIGTERM || got.ident == SIGINT)) break;

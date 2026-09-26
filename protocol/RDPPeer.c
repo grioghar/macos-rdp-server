@@ -1,6 +1,7 @@
 #define RDP_LOG_COMPONENT "peer"
 #include "logging/RDPLog.h"
 #include "protocol/RDPPeer.h"
+#include "protocol/RDPDRParse.h"
 #include "protocol/RDPWebDAV.h"
 #include "audio/AudioInput.h"
 
@@ -24,22 +25,8 @@
 #include <pthread.h>
 
 /* ── MS-RDPEFS (rdpdr) protocol constants ──────────────────────────────── */
-/* Packet ids from MS-RDPEFS specification §2.2.1.1 */
-#define RDPDR_CTYP_CORE                  0x4472
-#define PAKID_CORE_SERVER_ANNOUNCE       0x496E
-#define PAKID_CORE_CLIENTID_CONFIRM      0x4343
-#define PAKID_CORE_CLIENT_NAME           0x434E
-#define PAKID_CORE_CAPABILITY_REQUEST    0x5350
-#define PAKID_CORE_CAPABILITY_RESPONSE   0x4350
-#define PAKID_CORE_CLIENT_ANNOUNCE_REPLY 0x4352
-#define PAKID_CORE_DEVICE_LIST_ANNOUNCE  0x4441
-#define PAKID_CORE_DEVICE_REPLY          0x6472
-#define PAKID_CORE_DEVICE_IOCOMPLETION   0x4943   /* IRP I/O completion from client */
-#define RDPDR_DTYP_FILESYSTEM            0x00000008
-#define RDPDR_DTYP_PRINT                 0x00000004
-#define RDPDR_DTYP_SERIAL                0x00000001
-#define RDPDR_DTYP_PARALLEL              0x00000002
-#define RDPDR_DTYP_SMARTCARD             0x00000020
+/* Component / PacketId / DeviceType constants live in protocol/RDPDRParse.h
+ * (shared with the portable parser). Only the send-side constants remain here. */
 #define CAP_GENERAL_TYPE                 0x0001
 #define RDPDR_VERSION_MAJOR              0x0001
 #define RDPDR_VERSION_MINOR              0x000C
@@ -70,9 +57,6 @@
 
 /* IRP minor functions for IRP_MJ_DIRECTORY_CONTROL */
 #define IRP_MN_QUERY_DIRECTORY           0x00000001
-
-/* PAKID_CORE_DEVICE_IOREQUEST — client-to-server IRP request packet */
-#define PAKID_CORE_DEVICE_IOREQUEST      0x4952
 
 /* IRP_MJ_QUERY_INFORMATION / IRP_MJ_SET_INFORMATION classes */
 #define RDPDR_FileBasicInformation       0x00000004  /* timestamps + attrs */
@@ -1772,57 +1756,44 @@ bool rdpdr_send_delete_req(RDPPeerContext *ctx, uint32_t deviceId,
 }
 
 /* Decode one PDU from the rdpdr channel and advance the state machine. */
-static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
-    wStream stack; /* stack-allocated reader; avoids heap alloc for each PDU */
-    wStream *s = Stream_StaticInit(&stack, buf, (size_t)len);
-
-    if (Stream_GetRemainingLength(s) < 4) return;
-    UINT16 component, packetId;
-    Stream_Read_UINT16(s, component);
-    Stream_Read_UINT16(s, packetId);
-    if (component != RDPDR_CTYP_CORE) {
-        rdp_verbose("rdpdr: unknown component 0x%04x", component);
+/* Decode one inbound rdpdr PDU with the portable parser (protocol/RDPDRParse.c)
+ * and act on it. All wire parsing lives in the parser so it can be unit-tested
+ * and fuzzed off-device; this function only does state transitions, channel
+ * writes and WebDAV server lifecycle. Called under xportLock. */
+static void rdpdr_handle_pdu(RDPPeerContext *ctx, const BYTE *buf, ULONG len) {
+    RdpdrPdu pdu;
+    RdpdrParseStatus st = rdpdr_parse_pdu(buf, (size_t)len, &pdu);
+    switch (st) {
+    case RDPDR_PARSE_OK:
+        break;
+    case RDPDR_PARSE_BAD_COMPONENT:
+        rdp_verbose("rdpdr: unknown component 0x%04x", pdu.component);
+        return;
+    case RDPDR_PARSE_TRUNCATED:
+        rdp_verbose("rdpdr: truncated PDU (packetId=0x%04x, %lu bytes) — ignored",
+                    pdu.packetId, (unsigned long)len);
+        return;
+    case RDPDR_PARSE_BAD_LENGTH:
+        rdp_verbose("rdpdr: PDU packetId=0x%04x carries a length field larger "
+                    "than the PDU (%lu bytes) — ignored",
+                    pdu.packetId, (unsigned long)len);
         return;
     }
 
-    switch (packetId) {
+    switch (pdu.type) {
 
-    case PAKID_CORE_CLIENT_ANNOUNCE_REPLY: {
-        if (Stream_GetRemainingLength(s) < 8) break;
-        UINT16 maj, min; UINT32 cid;
-        Stream_Read_UINT16(s, maj);
-        Stream_Read_UINT16(s, min);
-        Stream_Read_UINT32(s, cid);
-        ctx->rdpdrClientId = (uint16_t)(cid & 0xFFFF);
+    case RDPDR_PDU_CLIENT_ANNOUNCE_REPLY: {
+        ctx->rdpdrClientId = (uint16_t)(pdu.u.announceReply.clientId & 0xFFFF);
         rdp_verbose("rdpdr: <- CLIENT_ANNOUNCE_REPLY v%u.%u clientId=%u",
-                    (unsigned)maj, (unsigned)min, (unsigned)ctx->rdpdrClientId);
+                    (unsigned)pdu.u.announceReply.versionMajor,
+                    (unsigned)pdu.u.announceReply.versionMinor,
+                    (unsigned)ctx->rdpdrClientId);
         break;
     }
 
-    case PAKID_CORE_CLIENT_NAME: {
-        if (Stream_GetRemainingLength(s) < 12) break;
-        UINT32 unicodeFlag, codePage, nameLen;
-        Stream_Read_UINT32(s, unicodeFlag);
-        Stream_Read_UINT32(s, codePage);
-        Stream_Read_UINT32(s, nameLen);
-        (void)codePage;
-        char name[128] = "(empty)";
-        if (nameLen > 0 && (size_t)nameLen <= Stream_GetRemainingLength(s)) {
-            if (unicodeFlag && nameLen >= 2) {
-                size_t chars = (nameLen / 2 < 127) ? nameLen / 2 : 127;
-                for (size_t i = 0; i < chars; i++) {
-                    UINT16 wc; Stream_Read_UINT16(s, wc);
-                    name[i] = (wc && wc < 128) ? (char)wc : '?';
-                    if (!wc) { name[i] = '\0'; break; }
-                }
-                name[chars] = '\0';
-            } else {
-                size_t n = (nameLen < 127) ? nameLen : 127;
-                Stream_Read(s, name, n);
-                name[n] = '\0';
-            }
-        }
-        rdp_verbose("rdpdr: <- CLIENT_NAME \"%s\"", name);
+    case RDPDR_PDU_CLIENT_NAME: {
+        rdp_verbose("rdpdr: <- CLIENT_NAME \"%s\"",
+                    pdu.u.clientName.name[0] ? pdu.u.clientName.name : "(empty)");
 
         /* Both ANNOUNCE_REPLY and NAME received — send caps + confirm. */
         if (ctx->rdpdrState == kRdpdrSentAnnounce) {
@@ -1837,38 +1808,30 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
         break;
     }
 
-    case PAKID_CORE_CAPABILITY_RESPONSE: {
-        if (Stream_GetRemainingLength(s) < 4) break;
-        UINT16 numCaps, pad;
-        Stream_Read_UINT16(s, numCaps);
-        Stream_Read_UINT16(s, pad);
-        (void)pad;
-        rdp_verbose("rdpdr: <- CAPABILITY_RESPONSE (%u caps)", (unsigned)numCaps);
+    case RDPDR_PDU_CAPABILITY_RESPONSE: {
+        rdp_verbose("rdpdr: <- CAPABILITY_RESPONSE (%u caps)",
+                    (unsigned)pdu.u.capabilityResponse.numCapabilities);
         /* We accept whatever the client advertises; no negotiation needed for
          * enumeration-only mode. Stay in ReceivedName until device list arrives. */
         break;
     }
 
-    case PAKID_CORE_DEVICE_LIST_ANNOUNCE: {
-        if (Stream_GetRemainingLength(s) < 4) break;
-        UINT32 deviceCount;
-        Stream_Read_UINT32(s, deviceCount);
-        rdp_info("rdpdr: <- DEVICE_LIST_ANNOUNCE — %u device(s)", (unsigned)deviceCount);
+    case RDPDR_PDU_DEVICE_LIST_ANNOUNCE: {
+        rdp_info("rdpdr: <- DEVICE_LIST_ANNOUNCE — %u device(s)",
+                 (unsigned)pdu.u.deviceList.deviceCount);
+        if (pdu.u.deviceList.deviceCount > pdu.u.deviceList.storedCount)
+            rdp_verbose("rdpdr: only the first %u of %u announced devices are handled",
+                        (unsigned)pdu.u.deviceList.storedCount,
+                        (unsigned)pdu.u.deviceList.deviceCount);
 
         /* Track how many drive slots we have filled so we can index webdavServers. */
         int driveSlot = 0;
 
-        for (UINT32 i = 0; i < deviceCount; i++) {
-            if (Stream_GetRemainingLength(s) < 20) break;
-            UINT32 devType, devId, dataLen;
-            char dosName[9] = {0};
-            Stream_Read_UINT32(s, devType);
-            Stream_Read_UINT32(s, devId);
-            Stream_Read(s, dosName, 8);
-            dosName[8] = '\0';
-            Stream_Read_UINT32(s, dataLen);
-            if (dataLen > 0 && (size_t)dataLen <= Stream_GetRemainingLength(s))
-                Stream_Seek(s, (size_t)dataLen);
+        for (uint32_t i = 0; i < pdu.u.deviceList.storedCount; i++) {
+            const RdpdrDevice *dev = &pdu.u.deviceList.devices[i];
+            const uint32_t devType = dev->deviceType;
+            const uint32_t devId   = dev->deviceId;
+            const char    *dosName = dev->dosName;
 
             const char *typeName = "unknown";
             switch (devType) {
@@ -1932,25 +1895,14 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
     }
 
     /* ── IRP I/O Completion (client -> server) ───────────────────────────── */
-    case PAKID_CORE_DEVICE_IOCOMPLETION: {
-        /* MS-RDPEFS §2.2.1.5  DR_DEVICE_IOCOMPLETION
-         * Header(4 already consumed) + DeviceId(4) + CompletionId(4) +
-         * IoStatus(4) = 12 more bytes before the payload. */
-        if (Stream_GetRemainingLength(s) < 12) {
-            rdp_verbose("rdpdr: IOCOMPLETION too short (%zu bytes remaining)",
-                        Stream_GetRemainingLength(s));
-            break;
-        }
-        UINT32 devId, completionId, ioStatus;
-        Stream_Read_UINT32(s, devId);
-        Stream_Read_UINT32(s, completionId);
-        Stream_Read_UINT32(s, ioStatus);
-
-        /* Grab the payload bytes before we call rdpdr_free_request (which invokes
-         * the callback that might use them).  The stream is stack-allocated over
-         * the original read buffer, so the pointer is valid during this call. */
-        const uint8_t *payload    = Stream_Pointer(s);
-        uint32_t       payloadLen = (uint32_t)Stream_GetRemainingLength(s);
+    case RDPDR_PDU_DEVICE_IOCOMPLETION: {
+        const uint32_t devId        = pdu.u.ioCompletion.deviceId;
+        const uint32_t completionId = pdu.u.ioCompletion.completionId;
+        const uint32_t ioStatus     = pdu.u.ioCompletion.ioStatus;
+        /* payload points into `buf`, which outlives this call (the read buffer
+         * in rdp_peer_pump_rdpdr), so handing it to the callback is safe. */
+        const uint8_t *payload      = pdu.u.ioCompletion.payload;
+        const uint32_t payloadLen   = pdu.u.ioCompletion.payloadLen;
 
         /* Look up the pending request, invoke its callback, and free the slot. */
         uint32_t matchedDev = rdpdr_free_request(ctx, completionId,
@@ -1969,8 +1921,10 @@ static void rdpdr_handle_pdu(RDPPeerContext *ctx, BYTE *buf, ULONG len) {
         break;
     }
 
+    case RDPDR_PDU_UNKNOWN:
     default:
-        rdp_verbose("rdpdr: unhandled packetId=0x%04x in state=%d", packetId, ctx->rdpdrState);
+        rdp_verbose("rdpdr: unhandled packetId=0x%04x in state=%d",
+                    pdu.packetId, ctx->rdpdrState);
         break;
     }
 }

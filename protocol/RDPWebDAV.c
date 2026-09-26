@@ -2,6 +2,7 @@
 #include "logging/RDPLog.h"
 #include "protocol/RDPWebDAV.h"
 #include "protocol/RDPPeer.h"
+#include "protocol/RDPDRParse.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,9 +31,6 @@
 #define WEBDAV_READ_BUF  65536   /* HTTP request read buffer */
 #define WEBDAV_MAX_PATH  512     /* Maximum URL path length */
 #define IRP_TIMEOUT_SEC  30      /* Maximum seconds to wait for an IRP response */
-
-/* FileFullDirectoryInformation entry minimum size (without FileName). */
-#define FFDI_FIXED_SIZE  72
 
 /* ── IRP waiter ─────────────────────────────────────────────────────────
  *
@@ -255,69 +253,22 @@ static void propfind_append_entry(const char *name, uint64_t size, bool isDir,
     if (n > 0) *pos += (size_t)n;
 }
 
-/* ── FileFullDirectoryInformation parser ───────────────────────────────── */
+/* ── FileFullDirectoryInformation -> PROPFIND entries ──────────────────── */
 
-/* Read a little-endian uint32 from a byte buffer at offset, advancing offset. */
-static uint32_t le32(const uint8_t *b, uint32_t *off) {
-    uint32_t v = (uint32_t)b[*off]
-               | ((uint32_t)b[*off+1] << 8)
-               | ((uint32_t)b[*off+2] << 16)
-               | ((uint32_t)b[*off+3] << 24);
-    *off += 4;
-    return v;
-}
-static uint64_t le64(const uint8_t *b, uint32_t *off) {
-    uint64_t lo = le32(b, off);
-    uint64_t hi = le32(b, off);
-    return lo | (hi << 32);
-}
-static uint16_t le16(const uint8_t *b, uint32_t *off) {
-    uint16_t v = (uint16_t)b[*off] | ((uint16_t)b[*off+1] << 8);
-    *off += 2;
-    return v;
-}
+/* Visitor state for rdpdr_parse_ffdi (protocol/RDPDRParse.c), which does the
+ * bounds-checked decoding of the QUERY_DIRECTORY completion payload. */
+typedef struct {
+    const char *urlPath;
+    char      **xml;
+    size_t     *cap;
+    size_t     *pos;
+} PropfindFfdiCtx;
 
-/* Parse a FileFullDirectoryInformation (MS-FSCC §2.4.14) buffer.
- * Calls the visitor for each entry; stops at NextEntryOffset==0. */
-typedef void (*FfdiVisitor)(const char *name, uint64_t fileSize,
-                             uint32_t fileAttrs, void *ud);
-
-/* Reserved for callers that want a callback-driven parse; currently the
- * PROPFIND handler inlines the equivalent logic for locality. */
-static void __attribute__((unused))
-parse_ffdi(const uint8_t *buf, uint32_t bufLen,
-           FfdiVisitor visit, void *ud) {
-    uint32_t off = 0;
-    while (off + FFDI_FIXED_SIZE <= bufLen) {
-        uint32_t startOff = off;
-        uint32_t nextOff  = le32(buf, &off);
-        (void)le32(buf, &off);       /* FileIndex */
-        (void)le64(buf, &off);       /* CreationTime */
-        (void)le64(buf, &off);       /* LastAccessTime */
-        (void)le64(buf, &off);       /* LastWriteTime */
-        (void)le64(buf, &off);       /* ChangeTime */
-        uint64_t fileSize  = le64(buf, &off);
-        (void)le64(buf, &off);       /* AllocationSize */
-        uint32_t fileAttrs = le32(buf, &off);
-        uint32_t nameLen   = le32(buf, &off);  /* in bytes (UTF-16LE) */
-        (void)le32(buf, &off);       /* EaSize */
-
-        /* Extract UTF-16LE filename, convert to UTF-8 (ASCII range only). */
-        if (off + nameLen <= bufLen && nameLen > 0 && nameLen <= 512) {
-            char name[257] = {0};
-            uint32_t chars = nameLen / 2;
-            if (chars > 256) chars = 256;
-            for (uint32_t ci = 0; ci < chars; ci++) {
-                uint16_t wc = le16(buf, &off);
-                name[ci] = (wc < 128 && wc > 0) ? (char)wc : '?';
-            }
-            name[chars] = '\0';
-            visit(name, fileSize, fileAttrs, ud);
-        }
-
-        if (nextOff == 0) break;
-        off = startOff + nextOff;
-    }
+static void propfind_ffdi_visit(const RdpdrFfdiEntry *e, void *ud) {
+    PropfindFfdiCtx *c = (PropfindFfdiCtx *)ud;
+    if (strcmp(e->name, ".") == 0 || strcmp(e->name, "..") == 0) return;
+    propfind_append_entry(e->name, e->fileSize, e->isDirectory,
+                          c->urlPath, c->xml, c->cap, c->pos);
 }
 
 /* ── IRP round-trip helpers ─────────────────────────────────────────────── */
@@ -621,42 +572,9 @@ static void handle_propfind(int fd, RDPPeerContext *ctx, uint32_t devId,
             QueryDirArgs qargs = { ctx, devId, fid, "*", qw };
             IrpWaiter *qret = irp_send_wait(ctx, send_query_dir, &qargs, qw);
             if (qret && qret->ioStatus == 0 && qret->payload && qret->payloadLen > 0) {
-                uint32_t off = 0;
-                const uint8_t *fbuf = qret->payload;
-                uint32_t flen = qret->payloadLen;
-                while (off + FFDI_FIXED_SIZE <= flen) {
-                    uint32_t startOff  = off;
-                    uint32_t nextOff   = le32(fbuf, &off);
-                    (void)le32(fbuf, &off);        /* FileIndex */
-                    (void)le64(fbuf, &off);        /* CreationTime */
-                    (void)le64(fbuf, &off);        /* LastAccessTime */
-                    (void)le64(fbuf, &off);        /* LastWriteTime */
-                    (void)le64(fbuf, &off);        /* ChangeTime */
-                    uint64_t fsize     = le64(fbuf, &off);
-                    (void)le64(fbuf, &off);        /* AllocationSize */
-                    uint32_t attrs     = le32(fbuf, &off);
-                    uint32_t nameLenB  = le32(fbuf, &off);
-                    (void)le32(fbuf, &off);        /* EaSize */
-
-                    if (off + nameLenB <= flen && nameLenB > 0 && nameLenB <= 512) {
-                        char name[257] = {0};
-                        uint32_t chars = nameLenB / 2;
-                        if (chars > 256) chars = 256;
-                        for (uint32_t ci = 0; ci < chars; ci++) {
-                            uint16_t wc = le16(fbuf, &off);
-                            name[ci] = (wc < 128 && wc > 0) ? (char)wc : '_';
-                        }
-                        name[chars] = '\0';
-                        if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0) {
-                            bool entryIsDir = (attrs & 0x10) != 0;
-                            propfind_append_entry(name, fsize, entryIsDir,
-                                                  urlPath, &xml, &cap, &pos);
-                        }
-                    }
-
-                    if (nextOff == 0) break;
-                    off = startOff + nextOff;
-                }
+                PropfindFfdiCtx fctx = { urlPath, &xml, &cap, &pos };
+                rdpdr_parse_ffdi(qret->payload, qret->payloadLen,
+                                 propfind_ffdi_visit, &fctx);
             }
             if (qret) irp_waiter_unref(qret);
         }

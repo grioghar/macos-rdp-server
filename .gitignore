@@ -7,3 +7,4 @@ build-*/
 *.xcodeproj/
 xcuserdata/
 DerivedData/
+.claude/

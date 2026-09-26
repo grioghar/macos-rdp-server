@@ -84,6 +84,7 @@ add_executable(macos-rdp-daemon
     daemon/DisplayControl.m
     daemon/AutoUpdate.m
     daemon/FileProvider/RDPFileProvider.m
+    protocol/RDPDRParse.c
     protocol/RDPPeer.c
     protocol/RDPWebDAV.c
     protocol/RDPDriveMount.m
@@ -152,6 +153,16 @@ target_compile_definitions(macos-rdp-daemon PRIVATE
     MACOS_RDP_BUILD_VERSION="${MACOS_RDP_BUILD_VERSION}"
     MACOS_RDP_VIRTUAL_DISPLAY=1
 )
+
+# ── Tests ─────────────────────────────────────────────────────────────────
+# Portable unit tests + optional libFuzzer harness for the protocol parsers
+# (tests/CMakeLists.txt). They need no FreeRDP/Cocoa and can also be built
+# standalone on Linux: cmake -S tests -B build-tests. Run with ctest.
+option(RDP_BUILD_TESTS "Build the protocol parser unit tests (ctest)" OFF)
+if(RDP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
 
 # ── Install ───────────────────────────────────────────────────────────────
 install(TARGETS macos-rdp-daemon DESTINATION /usr/local/sbin)

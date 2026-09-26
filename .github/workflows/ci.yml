@@ -38,7 +38,7 @@ jobs:
         uses: actions/cache@v5.0.5
         with:
           path: ~/freerdp-install
-          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v8-secfix
+          key: freerdp-${{ steps.freerdp-ver.outputs.ver }}-arm64-static-v9-nojson
 
       - name: Build FreeRDP (static, fork branch)
         if: steps.cache-freerdp.outputs.cache-hit != 'true'
@@ -48,6 +48,12 @@ jobs:
           INSTALL="$HOME/freerdp-install"
           git clone --depth 1 --branch "build/3.10.3-patched" \
             https://github.com/grioghar/FreeRDP.git "$SRC"
+          # WITH_JSON_DISABLED: the macos-14 image's Homebrew now ships json-c, which
+          # FreeRDP's JsonDetect.cmake auto-detects and compiles into libwinpr3.a
+          # (json.c.o). That json-c is never linked into the static daemon, so the
+          # daemon link fails with undefined _json_object_* symbols. WinPR JSON is
+          # only used by client-side AAD auth and proxy config, neither of which the
+          # server needs, so build FreeRDP with the built-in JSON stubs instead.
           cmake -S "$SRC" -B "$SRC/build" -G Ninja \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DCMAKE_C_FLAGS="-Os" -DCMAKE_CXX_FLAGS="-Os" \
@@ -56,6 +62,7 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET="14.0" \
             -DCMAKE_PREFIX_PATH="$OPENSSL_ROOT" \
             -DBUILD_SHARED_LIBS=OFF \
+            -DWITH_JSON_DISABLED=ON \
             -DWITH_SERVER=ON -DWITH_PLATFORM_SERVER=OFF \
             -DWITH_CLIENT=OFF -DWITH_CLIENT_COMMON=OFF -DWITH_PROXY=OFF \
             -DWITH_SHADOW=OFF -DWITH_SAMPLE=OFF -DWITH_WINPR_TOOLS=OFF \
